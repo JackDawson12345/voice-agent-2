@@ -24,11 +24,54 @@ const {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+const DEFAULT_RAILS_PUBLIC_URL = "https://riverboat-canyon-expensive.ngrok-free.dev";
+const RAILS_PUBLIC_URL = (
+  process.env.RAILS_PUBLIC_URL || DEFAULT_RAILS_PUBLIC_URL
+).replace(/\/$/, "");
+const DEFAULT_RAILS_CALLBACK_URL = `${RAILS_PUBLIC_URL}/node-call-results`;
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
 const INTRO_MESSAGE =
   "Hello, this is Jack from Unitel Direct. I was just calling to ask a quick question about your website and online enquiries. Is now an okay time?";
+
+// Stores Rails/Ruby context against the Twilio callSid.
+// This lets the WebSocket part know which Rails phone_number record to update
+// when Twilio later connects the media stream.
+const callContexts = new Map();
+
+async function postCallResultToRails(callbackUrl, payload) {
+  if (!callbackUrl) {
+    console.log("No Rails callback URL provided, skipping call result save.");
+    return;
+  }
+
+  try {
+    const response = await fetch(callbackUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Callback-Secret": process.env.CALLBACK_SECRET || "",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const responseText = await response.text();
+
+    if (!response.ok) {
+      console.error("Rails callback failed:", {
+        status: response.status,
+        response: responseText,
+      });
+      return;
+    }
+
+    console.log("Rails callback successful:", responseText);
+  } catch (error) {
+    console.error("Rails callback error:", error.message);
+  }
+}
 
 app.get("/", (req, res) => {
   res.send("AI caller backend is running");
@@ -38,24 +81,60 @@ app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     message: "Backend is running",
+    railsCallbackUrl: DEFAULT_RAILS_CALLBACK_URL,
   });
 });
 
 // Starts an outbound call.
 // Example body:
 // {
-//   "to": "+447123456789"
+//   "to": "+447123456789",
+//   "phone_number_id": 1,
+//   "callback_url": "https://your-rails-app-url/node-call-results"
 // }
 app.post("/start-call", async (req, res) => {
   try {
-    const { to } = req.body;
+    const {
+      to,
+      phone_number_id,
+      phoneNumberId,
+      callback_url,
+      callbackUrl,
+    } = req.body;
+
+    if (!to) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing phone number",
+      });
+    }
+
+    const resolvedPhoneNumberId = phone_number_id || phoneNumberId || null;
+    const resolvedCallbackUrl =
+      callback_url || callbackUrl || DEFAULT_RAILS_CALLBACK_URL;
 
     const call = await startOutboundCall(to);
+
+    callContexts.set(call.sid, {
+      phoneNumberId: resolvedPhoneNumberId,
+      callbackUrl: resolvedCallbackUrl,
+      to,
+      startedAt: new Date().toISOString(),
+    });
+
+    console.log("Call context stored:", {
+      callSid: call.sid,
+      phoneNumberId: resolvedPhoneNumberId,
+      callbackUrl: resolvedCallbackUrl,
+      to,
+    });
 
     res.json({
       success: true,
       message: "Call started",
       callSid: call.sid,
+      callbackUrl: resolvedCallbackUrl,
+      phoneNumberId: resolvedPhoneNumberId,
     });
   } catch (error) {
     console.error("Call error:", error.message);
@@ -167,7 +246,11 @@ wss.on("connection", (ws) => {
   let currentStreamSid = null;
 
   const conversationHistory = [];
+  const fullTranscript = [];
   const sessionMemory = createSessionMemory();
+
+  let callContext = null;
+  let callResultSent = false;
 
   let aiIsThinking = false;
   let lastFinalTranscript = "";
@@ -189,6 +272,65 @@ wss.on("connection", (ws) => {
   // This prevents tiny bits of background noise from cutting the AI off.
   let pendingBargeInTimer = null;
   let pendingBargeInTranscript = "";
+
+  function addTranscriptLine(role, content) {
+    if (!content) {
+      return;
+    }
+
+    fullTranscript.push({
+      role,
+      content,
+      at: new Date().toISOString(),
+    });
+  }
+
+  async function sendCallResultToRails(reason) {
+    if (callResultSent) {
+      return;
+    }
+
+    if (!currentCallSid) {
+      console.log("Cannot send call result because callSid is missing");
+      return;
+    }
+
+    callResultSent = true;
+
+    const context = callContext || callContexts.get(currentCallSid);
+
+    if (!context) {
+      console.log("No call context found for call result:", currentCallSid);
+      return;
+    }
+
+    const payload = {
+      phone_number_id: context.phoneNumberId,
+      to: context.to,
+      call_sid: currentCallSid,
+      stream_sid: currentStreamSid,
+      reason,
+      started_at: context.startedAt,
+      ended_at: new Date().toISOString(),
+      total_audio_packets: audioPacketCount,
+      memory: sessionMemory,
+      memory_log: formatSessionMemoryForLog(sessionMemory),
+      transcript: fullTranscript,
+      conversation_history: conversationHistory,
+    };
+
+    console.log("Sending call result to Rails:", {
+      callbackUrl: context.callbackUrl,
+      phoneNumberId: context.phoneNumberId,
+      callSid: currentCallSid,
+      transcriptLines: fullTranscript.length,
+      reason,
+    });
+
+    await postCallResultToRails(context.callbackUrl, payload);
+
+    callContexts.delete(currentCallSid);
+  }
 
   function startIntroTimer() {
     if (introTimer) {
@@ -237,8 +379,12 @@ wss.on("connection", (ws) => {
           role: "assistant",
           content: INTRO_MESSAGE,
         });
+
+        addTranscriptLine("assistant", INTRO_MESSAGE);
       } catch (error) {
         console.error("Intro speech error:", error.message);
+        addTranscriptLine("system", `Intro speech error: ${error.message}`);
+        await endCallNow("Intro speech error");
       }
     }, 2000);
   }
@@ -251,84 +397,88 @@ wss.on("connection", (ws) => {
   }
 
   function transcriptSuggestsGoodbye(text) {
-  const lower = String(text || "").toLowerCase();
+    const lower = String(text || "").toLowerCase();
 
-  return (
-    lower.includes("bye") ||
-    lower.includes("goodbye") ||
-    lower.includes("thanks bye") ||
-    lower.includes("thank you bye") ||
-    lower.includes("that is all") ||
-    lower.includes("that's all") ||
-    lower.includes("speak soon") ||
-    lower.includes("talk soon")
-  );
-}
-
-function isLeadComplete(memory) {
-  return Boolean(
-    memory.isInterested === "yes" &&
-      memory.wantsCallback &&
-      memory.callbackPhone &&
-      memory.callbackTime
-  );
-}
-
-function shouldEndCallAfterReply({ cleanTranscript, sessionMemory, aiReply }) {
-  const lowerReply = String(aiReply || "").toLowerCase();
-
-  if (sessionMemory.doNotCall) {
-    return true;
+    return (
+      lower.includes("bye") ||
+      lower.includes("goodbye") ||
+      lower.includes("thanks bye") ||
+      lower.includes("thank you bye") ||
+      lower.includes("that is all") ||
+      lower.includes("that's all") ||
+      lower.includes("speak soon") ||
+      lower.includes("talk soon")
+    );
   }
 
-  if (transcriptSuggestsGoodbye(cleanTranscript)) {
-    return true;
+  function isLeadComplete(memory) {
+    return Boolean(
+      memory.isInterested === "yes" &&
+        memory.wantsCallback &&
+        memory.callbackPhone &&
+        memory.callbackTime
+    );
   }
 
-  if (sessionMemory.isInterested === "no" && !sessionMemory.wantsCallback) {
-    return true;
-  }
+  function shouldEndCallAfterReply({ cleanTranscript, sessionMemory, aiReply }) {
+    const lowerReply = String(aiReply || "").toLowerCase();
 
-  if (isLeadComplete(sessionMemory)) {
-    const replySoundsFinal =
-      lowerReply.includes("we'll call") ||
-      lowerReply.includes("we will call") ||
-      lowerReply.includes("call you") ||
-      lowerReply.includes("thanks") ||
-      lowerReply.includes("thank you") ||
-      lowerReply.includes("goodbye") ||
-      lowerReply.includes("bye");
-
-    if (replySoundsFinal) {
+    if (sessionMemory.doNotCall) {
       return true;
     }
-  }
 
-  return false;
-}
-
-async function endCallNow(reason) {
-  try {
-    if (callIsEnding) {
-      return;
+    if (transcriptSuggestsGoodbye(cleanTranscript)) {
+      return true;
     }
 
-    callIsEnding = true;
-
-    console.log("Ending call:", reason);
-
-    if (!currentCallSid) {
-      console.log("Cannot end call because callSid is missing");
-      return;
+    if (sessionMemory.isInterested === "no" && !sessionMemory.wantsCallback) {
+      return true;
     }
 
-    await endOutboundCall(currentCallSid);
+    if (isLeadComplete(sessionMemory)) {
+      const replySoundsFinal =
+        lowerReply.includes("we'll call") ||
+        lowerReply.includes("we will call") ||
+        lowerReply.includes("call you") ||
+        lowerReply.includes("thanks") ||
+        lowerReply.includes("thank you") ||
+        lowerReply.includes("goodbye") ||
+        lowerReply.includes("bye");
 
-    console.log("Call ended successfully");
-  } catch (error) {
-    console.error("Error ending call:", error.message);
+      if (replySoundsFinal) {
+        return true;
+      }
+    }
+
+    return false;
   }
-}
+
+  async function endCallNow(reason) {
+    try {
+      if (callIsEnding) {
+        return;
+      }
+
+      callIsEnding = true;
+
+      console.log("Ending call:", reason);
+
+      if (!currentCallSid) {
+        console.log("Cannot end call because callSid is missing");
+        return;
+      }
+
+      await endOutboundCall(currentCallSid);
+
+      console.log("Call ended successfully");
+
+      await sendCallResultToRails(reason);
+    } catch (error) {
+      console.error("Error ending call:", error.message);
+      addTranscriptLine("system", `Error ending call: ${error.message}`);
+      await sendCallResultToRails("Error ending call");
+    }
+  }
 
   async function createAndPlayAIReply(cleanTranscript) {
     if (aiIsThinking && !interruptionHappened) {
@@ -364,6 +514,7 @@ async function endCallNow(reason) {
       }
 
       console.log("AI replied:", aiReply);
+      addTranscriptLine("assistant", aiReply);
 
       const aiAudio = await textToSpeech(aiReply);
 
@@ -410,112 +561,114 @@ async function endCallNow(reason) {
     } catch (error) {
       aiIsThinking = false;
       console.error("AI or text-to-speech error:", error.message);
+      addTranscriptLine("system", `AI or text-to-speech error: ${error.message}`);
+      await endCallNow("AI or text-to-speech error");
     }
   }
 
   function clearPendingBargeInTimer() {
-  if (pendingBargeInTimer) {
-    clearTimeout(pendingBargeInTimer);
-    pendingBargeInTimer = null;
+    if (pendingBargeInTimer) {
+      clearTimeout(pendingBargeInTimer);
+      pendingBargeInTimer = null;
+    }
+
+    pendingBargeInTranscript = "";
   }
 
-  pendingBargeInTranscript = "";
-}
+  function looksLikeRealInterruption(text) {
+    const cleanText = String(text || "").trim();
 
-function looksLikeRealInterruption(text) {
-  const cleanText = String(text || "").trim();
+    if (!cleanText) {
+      return false;
+    }
 
-  if (!cleanText) {
+    const words = cleanText.split(/\s+/).filter(Boolean);
+
+    // Ignore very short noise-like fragments.
+    const ignoredFragments = [
+      "uh",
+      "um",
+      "er",
+      "ah",
+      "mm",
+      "hm",
+      "hmm",
+      "noise",
+    ];
+
+    if (ignoredFragments.includes(cleanText.toLowerCase())) {
+      return false;
+    }
+
+    // Strong interruptions.
+    const strongPhrases = [
+      "hello",
+      "wait",
+      "stop",
+      "sorry",
+      "actually",
+      "no",
+      "yes",
+      "what",
+      "how",
+      "can",
+      "could",
+    ];
+
+    if (strongPhrases.some((phrase) => cleanText.toLowerCase().startsWith(phrase))) {
+      return true;
+    }
+
+    // Two or more words is likely intentional speech.
+    if (words.length >= 2) {
+      return true;
+    }
+
+    // One word can still be valid, but avoid very tiny fragments.
+    if (cleanText.length >= 5) {
+      return true;
+    }
+
     return false;
   }
 
-  const words = cleanText.split(/\s+/).filter(Boolean);
-
-  // Ignore very short noise-like fragments.
-  const ignoredFragments = [
-    "uh",
-    "um",
-    "er",
-    "ah",
-    "mm",
-    "hm",
-    "hmm",
-    "noise",
-  ];
-
-  if (ignoredFragments.includes(cleanText.toLowerCase())) {
-    return false;
-  }
-
-  // Strong interruptions.
-  const strongPhrases = [
-    "hello",
-    "wait",
-    "stop",
-    "sorry",
-    "actually",
-    "no",
-    "yes",
-    "what",
-    "how",
-    "can",
-    "could",
-  ];
-
-  if (strongPhrases.some((phrase) => cleanText.toLowerCase().startsWith(phrase))) {
-    return true;
-  }
-
-  // Two or more words is likely intentional speech.
-  if (words.length >= 2) {
-    return true;
-  }
-
-  // One word can still be valid, but avoid very tiny fragments.
-  if (cleanText.length >= 5) {
-    return true;
-  }
-
-  return false;
-}
-
-function scheduleBargeIn(cleanTranscript) {
-  if (!aiIsSpeaking) {
-    return;
-  }
-
-  if (!looksLikeRealInterruption(cleanTranscript)) {
-    return;
-  }
-
-  pendingBargeInTranscript = cleanTranscript;
-
-  if (pendingBargeInTimer) {
-    return;
-  }
-
-  // Wait briefly before clearing audio.
-  // This makes interruption feel less harsh and filters out quick false starts.
-  pendingBargeInTimer = setTimeout(() => {
+  function scheduleBargeIn(cleanTranscript) {
     if (!aiIsSpeaking) {
-      clearPendingBargeInTimer();
       return;
     }
 
-    console.log("Customer interrupted AI:", pendingBargeInTranscript);
+    if (!looksLikeRealInterruption(cleanTranscript)) {
+      return;
+    }
 
-    interruptionHappened = true;
-    aiIsSpeaking = false;
-    activeAudioMark = null;
+    pendingBargeInTranscript = cleanTranscript;
 
-    // Invalidate current AI/TTS work.
-    responseGenerationId++;
+    if (pendingBargeInTimer) {
+      return;
+    }
 
-    clearTwilioAudio(ws, currentStreamSid);
+    // Wait briefly before clearing audio.
+    // This makes interruption feel less harsh and filters out quick false starts.
+    pendingBargeInTimer = setTimeout(() => {
+      if (!aiIsSpeaking) {
+        clearPendingBargeInTimer();
+        return;
+      }
 
-    clearPendingBargeInTimer();
-  }, 250);
-}
+      console.log("Customer interrupted AI:", pendingBargeInTranscript);
+
+      interruptionHappened = true;
+      aiIsSpeaking = false;
+      activeAudioMark = null;
+
+      // Invalidate current AI/TTS work.
+      responseGenerationId++;
+
+      clearTwilioAudio(ws, currentStreamSid);
+
+      clearPendingBargeInTimer();
+    }, 250);
+  }
 
   const speechToText = createSpeechToTextStream({
     onTranscript: async ({ transcript, isFinal, utteranceEnd }) => {
@@ -551,6 +704,7 @@ function scheduleBargeIn(cleanTranscript) {
         lastFinalTranscript = cleanTranscript;
 
         console.log("Customer said:", cleanTranscript);
+        addTranscriptLine("customer", cleanTranscript);
 
         const memoryUpdate = updateSessionMemoryFromTranscript(
           sessionMemory,
@@ -569,6 +723,7 @@ function scheduleBargeIn(cleanTranscript) {
             "I understand. Sorry for disturbing you, we will not call again. Thank you, goodbye.";
 
           console.log("AI replied:", doNotCallReply);
+          addTranscriptLine("assistant", doNotCallReply);
 
           const doNotCallAudio = await textToSpeech(doNotCallReply);
           const markName = `ai-audio-${Date.now()}`;
@@ -598,6 +753,8 @@ function scheduleBargeIn(cleanTranscript) {
       } catch (error) {
         aiIsThinking = false;
         console.error("Transcript handling error:", error.message);
+        addTranscriptLine("system", `Transcript handling error: ${error.message}`);
+        await endCallNow("Transcript handling error");
       }
     },
   });
@@ -613,10 +770,13 @@ function scheduleBargeIn(cleanTranscript) {
       if (data.event === "start") {
         currentCallSid = data.start.callSid;
         currentStreamSid = data.start.streamSid;
+        callContext = callContexts.get(currentCallSid) || null;
 
         console.log("Media stream started:", {
           callSid: currentCallSid,
           streamSid: currentStreamSid,
+          hasCallContext: Boolean(callContext),
+          phoneNumberId: callContext?.phoneNumberId || null,
         });
 
         startIntroTimer();
@@ -659,9 +819,13 @@ function scheduleBargeIn(cleanTranscript) {
           streamSid: currentStreamSid,
           totalAudioPackets: audioPacketCount,
         });
+
+        sendCallResultToRails("Twilio media stream stopped");
       }
     } catch (error) {
       console.error("Error reading media stream message:", error.message);
+      addTranscriptLine("system", `Error reading media stream message: ${error.message}`);
+      sendCallResultToRails("Error reading media stream message");
     }
   });
 
@@ -675,6 +839,8 @@ function scheduleBargeIn(cleanTranscript) {
       streamSid: currentStreamSid,
       totalAudioPackets: audioPacketCount,
     });
+
+    sendCallResultToRails("Twilio media stream disconnected");
   });
 
   ws.on("error", (error) => {
@@ -683,6 +849,8 @@ function scheduleBargeIn(cleanTranscript) {
     speechToText.close();
 
     console.error("WebSocket error:", error.message);
+    addTranscriptLine("system", `WebSocket error: ${error.message}`);
+    sendCallResultToRails("WebSocket error");
   });
 });
 
