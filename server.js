@@ -34,7 +34,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
 const INTRO_MESSAGE =
-  "Hello, this is Jack from Unitel Direct. I was just calling to ask a quick question about your website and online enquiries. Is now an okay time?";
+  "Hello, this is Lily from Unitel Direct. I was just calling to ask a quick question about your website and online enquiries. Is now an okay time?";
 
 // Stores Rails/Ruby context against the Twilio callSid.
 // This lets the WebSocket part know which Rails phone_number record to update
@@ -258,6 +258,8 @@ wss.on("connection", (ws) => {
   let customerHasSpoken = false;
   let introHasPlayed = false;
   let introTimer = null;
+
+  let callScreeningReplySent = false;
 
   // Barge-in state.
   let aiIsSpeaking = false;
@@ -670,6 +672,61 @@ wss.on("connection", (ws) => {
     }, 250);
   }
 
+  function isIphoneCallScreeningPrompt(text) {
+  const lower = String(text || "").toLowerCase();
+
+  return (
+    lower.includes("record your name and reason") ||
+    lower.includes("if you record your name") ||
+    lower.includes("reason for calling") ||
+    lower.includes("i'll see if this person is available") ||
+    lower.includes("i will see if this person is available") ||
+    lower.includes("see if this person is available")
+  );
+}
+
+async function answerIphoneCallScreeningPrompt() {
+  if (callScreeningReplySent) {
+    return;
+  }
+
+  if (!currentStreamSid) {
+    console.log("Cannot answer call screening because streamSid is missing");
+    return;
+  }
+
+  callScreeningReplySent = true;
+
+  const screeningReply =
+    "Hi, this is Lily from Unitel Direct calling regarding a website package.";
+
+  console.log("AI replied to iPhone call screening:", screeningReply);
+
+  addTranscriptLine("system", "iPhone call screening prompt detected");
+  addTranscriptLine("assistant", screeningReply);
+
+  const thisResponseId = ++responseGenerationId;
+  const screeningAudio = await textToSpeech(screeningReply);
+
+  if (thisResponseId !== responseGenerationId) {
+    console.log("Call screening reply cancelled");
+    return;
+  }
+
+  const markName = `call-screening-audio-${Date.now()}`;
+
+  activeAudioMark = markName;
+  aiIsSpeaking = true;
+  interruptionHappened = false;
+
+  sendAudioToTwilio(ws, currentStreamSid, screeningAudio, markName);
+
+  conversationHistory.push({
+    role: "assistant",
+    content: screeningReply,
+  });
+}
+
   const speechToText = createSpeechToTextStream({
     onTranscript: async ({ transcript, isFinal, utteranceEnd }) => {
       try {
@@ -678,6 +735,15 @@ wss.on("connection", (ws) => {
         }
 
         const cleanTranscript = transcript.trim();
+
+        if (cleanTranscript && isIphoneCallScreeningPrompt(cleanTranscript)) {
+          customerHasSpoken = true;
+          clearIntroTimer();
+
+          await answerIphoneCallScreeningPrompt();
+
+          return;
+        }
 
         // Barge-in: stop AI audio as soon as the customer starts speaking.
         if (cleanTranscript && aiIsSpeaking) {
