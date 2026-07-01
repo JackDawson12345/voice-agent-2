@@ -46,6 +46,14 @@ const INTRO_DELAY_MS = Number(process.env.INTRO_DELAY_MS || 2000);
 const SILENCE_TIMEOUT_MS = Number(process.env.SILENCE_TIMEOUT_MS || 8000);
 const MAX_SILENCE_CHECKS = Number(process.env.MAX_SILENCE_CHECKS || 1);
 
+const CALLBACK_PHONE_COLLECTION_WAIT_MS = Number(
+  process.env.CALLBACK_PHONE_COLLECTION_WAIT_MS || 5000
+);
+
+const CALLBACK_PHONE_SILENCE_TIMEOUT_MS = Number(
+  process.env.CALLBACK_PHONE_SILENCE_TIMEOUT_MS || 16000
+);
+
 // Stores Rails/Ruby context against the Twilio callSid.
 // This lets the WebSocket part know which Rails phone_number record to update
 // when Twilio later connects the media stream.
@@ -93,7 +101,8 @@ app.get("/health", (req, res) => {
     message: "Backend is running",
     railsCallbackUrl: DEFAULT_RAILS_CALLBACK_URL,
     silenceTimeoutMs: SILENCE_TIMEOUT_MS,
-    maxSilenceChecks: MAX_SILENCE_CHECKS,
+    callbackPhoneCollectionWaitMs: CALLBACK_PHONE_COLLECTION_WAIT_MS,
+    callbackPhoneSilenceTimeoutMs: CALLBACK_PHONE_SILENCE_TIMEOUT_MS,
   });
 });
 
@@ -276,6 +285,11 @@ wss.on("connection", (ws) => {
   let silenceCheckCount = 0;
   const silenceWatchMarks = new Set();
 
+  // Callback phone number collection state.
+  let awaitingCallbackPhone = false;
+  let callbackPhoneBuffer = [];
+  let callbackPhoneCollectionTimer = null;
+
   // iPhone call screening state.
   let callScreeningReplySent = false;
 
@@ -370,6 +384,13 @@ wss.on("connection", (ws) => {
     }
   }
 
+  function clearCallbackPhoneCollectionTimer() {
+    if (callbackPhoneCollectionTimer) {
+      clearTimeout(callbackPhoneCollectionTimer);
+      callbackPhoneCollectionTimer = null;
+    }
+  }
+
   function clearPendingVoicemailTimer() {
     if (pendingVoicemailTimer) {
       clearTimeout(pendingVoicemailTimer);
@@ -384,6 +405,12 @@ wss.on("connection", (ws) => {
     }
 
     pendingBargeInTranscript = "";
+  }
+
+  function resetCallbackPhoneCollection() {
+    awaitingCallbackPhone = false;
+    callbackPhoneBuffer = [];
+    clearCallbackPhoneCollectionTimer();
   }
 
   function cancelActiveAudioTracking() {
@@ -401,6 +428,31 @@ wss.on("connection", (ws) => {
     }
 
     silenceWatchMarks.add(markName);
+  }
+
+  function getCurrentSilenceTimeoutMs() {
+    if (awaitingCallbackPhone) {
+      return CALLBACK_PHONE_SILENCE_TIMEOUT_MS;
+    }
+
+    return SILENCE_TIMEOUT_MS;
+  }
+
+  function aiReplyRequestsCallbackPhone(aiReply) {
+    const lower = String(aiReply || "").toLowerCase();
+
+    return (
+      lower.includes("best phone number") ||
+      lower.includes("best number") ||
+      lower.includes("phone number for") ||
+      lower.includes("number for them to call") ||
+      lower.includes("number to call you") ||
+      lower.includes("call you on") ||
+      lower.includes("callback number") ||
+      lower.includes("mobile number") ||
+      lower.includes("rest of the number") ||
+      lower.includes("rest of your number")
+    );
   }
 
   function startSilenceTimer() {
@@ -422,14 +474,17 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    const timeoutMs = getCurrentSilenceTimeoutMs();
+
     silenceTimer = setTimeout(async () => {
       silenceTimer = null;
       await handleSilenceTimeout();
-    }, SILENCE_TIMEOUT_MS);
+    }, timeoutMs);
 
     console.log("Silence timer started:", {
-      timeoutMs: SILENCE_TIMEOUT_MS,
+      timeoutMs,
       silenceCheckCount,
+      awaitingCallbackPhone,
     });
   }
 
@@ -451,6 +506,7 @@ wss.on("connection", (ws) => {
     console.log("Silence timeout reached:", {
       silenceCheckCount,
       maxSilenceChecks: MAX_SILENCE_CHECKS,
+      awaitingCallbackPhone,
     });
 
     if (silenceCheckCount <= MAX_SILENCE_CHECKS) {
@@ -535,6 +591,7 @@ wss.on("connection", (ws) => {
 
       clearIntroTimer();
       clearSilenceTimer();
+      clearCallbackPhoneCollectionTimer();
       clearPendingBargeInTimer();
       clearPendingVoicemailTimer();
 
@@ -642,6 +699,7 @@ wss.on("connection", (ws) => {
 
     clearIntroTimer();
     clearSilenceTimer();
+    resetCallbackPhoneCollection();
 
     const screeningReply =
       "Hi, this is Lily from Unitel Direct. I’m calling regarding a website package for local businesses.";
@@ -729,6 +787,7 @@ wss.on("connection", (ws) => {
 
     clearIntroTimer();
     clearSilenceTimer();
+    resetCallbackPhoneCollection();
     clearPendingBargeInTimer();
 
     // If Lily's intro has already started playing, stop it.
@@ -847,6 +906,102 @@ wss.on("connection", (ws) => {
     return false;
   }
 
+  async function processFinalCustomerTranscript(cleanTranscript) {
+    console.log("Customer said:", cleanTranscript);
+    addTranscriptLine("customer", cleanTranscript);
+
+    const memoryUpdate = updateSessionMemoryFromTranscript(
+      sessionMemory,
+      cleanTranscript
+    );
+
+    if (memoryUpdate.changedFields.length) {
+      console.log("Session memory updated:", {
+        changedFields: memoryUpdate.changedFields,
+        memory: formatSessionMemoryForLog(sessionMemory),
+      });
+    }
+
+    if (sessionMemory.doNotCall) {
+      resetCallbackPhoneCollection();
+
+      const doNotCallReply =
+        "I understand. Sorry for disturbing you, we will not call again. Thank you, goodbye.";
+
+      console.log("AI replied:", doNotCallReply);
+      addTranscriptLine("assistant", doNotCallReply);
+
+      const doNotCallAudio = await textToSpeech(doNotCallReply);
+      const markName = `ai-audio-${Date.now()}`;
+
+      activeAudioMark = markName;
+      aiIsSpeaking = true;
+      pendingHangupAfterMark = markName;
+
+      console.log("Call will end after do-not-call message:", markName);
+
+      sendAudioToTwilio(ws, currentStreamSid, doNotCallAudio, markName);
+
+      conversationHistory.push({
+        role: "user",
+        content: cleanTranscript,
+      });
+
+      conversationHistory.push({
+        role: "assistant",
+        content: doNotCallReply,
+      });
+
+      return;
+    }
+
+    await createAndPlayAIReply(cleanTranscript);
+  }
+
+  function queueCallbackPhoneTranscript(cleanTranscript) {
+    clearSilenceTimer();
+    clearCallbackPhoneCollectionTimer();
+
+    silenceCheckCount = 0;
+
+    callbackPhoneBuffer.push(cleanTranscript);
+
+    console.log("Collecting callback phone number transcript:", {
+      currentPart: cleanTranscript,
+      fullBuffer: callbackPhoneBuffer,
+      waitMs: CALLBACK_PHONE_COLLECTION_WAIT_MS,
+    });
+
+    callbackPhoneCollectionTimer = setTimeout(async () => {
+      try {
+        callbackPhoneCollectionTimer = null;
+
+        const combinedTranscript = callbackPhoneBuffer
+          .join(" ")
+          .replace(/\s+/g, " ")
+          .trim();
+
+        callbackPhoneBuffer = [];
+        awaitingCallbackPhone = false;
+
+        if (!combinedTranscript) {
+          return;
+        }
+
+        console.log("Callback phone number transcript ready:", combinedTranscript);
+
+        await processFinalCustomerTranscript(combinedTranscript);
+      } catch (error) {
+        console.error("Callback phone collection error:", error.message);
+        addTranscriptLine(
+          "system",
+          `Callback phone collection error: ${error.message}`
+        );
+        await endCallNow("Callback phone collection error");
+      }
+    }, CALLBACK_PHONE_COLLECTION_WAIT_MS);
+  }
+
   async function createAndPlayAIReply(cleanTranscript) {
     if (voicemailHandled) {
       console.log("Skipping AI reply because voicemail has already been handled.");
@@ -921,9 +1076,21 @@ wss.on("connection", (ws) => {
       });
 
       if (shouldHangUp) {
+        resetCallbackPhoneCollection();
+
         pendingHangupAfterMark = markName;
         console.log("Call will end after AI finishes speaking:", markName);
       } else {
+        if (aiReplyRequestsCallbackPhone(aiReply)) {
+          awaitingCallbackPhone = true;
+          callbackPhoneBuffer = [];
+          clearCallbackPhoneCollectionTimer();
+
+          console.log("Lily is now waiting for the callback phone number.");
+        } else {
+          resetCallbackPhoneCollection();
+        }
+
         markShouldStartSilenceTimer(markName);
       }
 
@@ -1081,6 +1248,7 @@ wss.on("connection", (ws) => {
         // This must not be treated as voicemail.
         if (isIphoneCallScreeningPrompt(cleanTranscript)) {
           silenceCheckCount = 0;
+          resetCallbackPhoneCollection();
           await answerIphoneCallScreeningPrompt();
           return;
         }
@@ -1089,6 +1257,7 @@ wss.on("connection", (ws) => {
         // This leaves one message, then hangs up.
         if (isVoicemailOrAnswerMachine(cleanTranscript)) {
           silenceCheckCount = 0;
+          resetCallbackPhoneCollection();
           await leaveVoicemailAndHangUp(cleanTranscript);
           return;
         }
@@ -1117,53 +1286,12 @@ wss.on("connection", (ws) => {
         lastFinalTranscript = cleanTranscript;
         silenceCheckCount = 0;
 
-        console.log("Customer said:", cleanTranscript);
-        addTranscriptLine("customer", cleanTranscript);
-
-        const memoryUpdate = updateSessionMemoryFromTranscript(
-          sessionMemory,
-          cleanTranscript
-        );
-
-        if (memoryUpdate.changedFields.length) {
-          console.log("Session memory updated:", {
-            changedFields: memoryUpdate.changedFields,
-            memory: formatSessionMemoryForLog(sessionMemory),
-          });
-        }
-
-        if (sessionMemory.doNotCall) {
-          const doNotCallReply =
-            "I understand. Sorry for disturbing you, we will not call again. Thank you, goodbye.";
-
-          console.log("AI replied:", doNotCallReply);
-          addTranscriptLine("assistant", doNotCallReply);
-
-          const doNotCallAudio = await textToSpeech(doNotCallReply);
-          const markName = `ai-audio-${Date.now()}`;
-
-          activeAudioMark = markName;
-          aiIsSpeaking = true;
-          pendingHangupAfterMark = markName;
-
-          console.log("Call will end after do-not-call message:", markName);
-
-          sendAudioToTwilio(ws, currentStreamSid, doNotCallAudio, markName);
-
-          conversationHistory.push({
-            role: "user",
-            content: cleanTranscript,
-          });
-
-          conversationHistory.push({
-            role: "assistant",
-            content: doNotCallReply,
-          });
-
+        if (awaitingCallbackPhone) {
+          queueCallbackPhoneTranscript(cleanTranscript);
           return;
         }
 
-        await createAndPlayAIReply(cleanTranscript);
+        await processFinalCustomerTranscript(cleanTranscript);
       } catch (error) {
         aiIsThinking = false;
         console.error("Transcript handling error:", error.message);
@@ -1242,6 +1370,7 @@ wss.on("connection", (ws) => {
       if (data.event === "stop") {
         clearIntroTimer();
         clearSilenceTimer();
+        clearCallbackPhoneCollectionTimer();
         clearPendingBargeInTimer();
         clearPendingVoicemailTimer();
         speechToText.close();
@@ -1266,6 +1395,7 @@ wss.on("connection", (ws) => {
   ws.on("close", () => {
     clearIntroTimer();
     clearSilenceTimer();
+    clearCallbackPhoneCollectionTimer();
     clearPendingBargeInTimer();
     clearPendingVoicemailTimer();
     speechToText.close();
@@ -1282,6 +1412,7 @@ wss.on("connection", (ws) => {
   ws.on("error", (error) => {
     clearIntroTimer();
     clearSilenceTimer();
+    clearCallbackPhoneCollectionTimer();
     clearPendingBargeInTimer();
     clearPendingVoicemailTimer();
     speechToText.close();
