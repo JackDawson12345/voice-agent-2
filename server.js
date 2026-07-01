@@ -6,6 +6,7 @@ require("dotenv").config();
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
+const twilio = require("twilio");
 
 const {
   startOutboundCall,
@@ -53,6 +54,27 @@ const CALLBACK_PHONE_COLLECTION_WAIT_MS = Number(
 const CALLBACK_PHONE_SILENCE_TIMEOUT_MS = Number(
   process.env.CALLBACK_PHONE_SILENCE_TIMEOUT_MS || 16000
 );
+
+const TRANSFER_PHONE_NUMBER = process.env.TRANSFER_PHONE_NUMBER || "";
+const TRANSFER_CALLER_ID =
+  process.env.TRANSFER_CALLER_ID || process.env.TWILIO_PHONE_NUMBER || "";
+const TRANSFER_MESSAGE =
+  process.env.TRANSFER_MESSAGE || "Perfect, I’ll put you through to someone now.";
+const ENABLE_CALL_TRANSFER = process.env.ENABLE_CALL_TRANSFER !== "false";
+
+const twilioClient =
+  process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
+    ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
+    : null;
+
+function xmlEscape(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
 
 // Stores Rails/Ruby context against the Twilio callSid.
 // This lets the WebSocket part know which Rails phone_number record to update
@@ -103,6 +125,8 @@ app.get("/health", (req, res) => {
     silenceTimeoutMs: SILENCE_TIMEOUT_MS,
     callbackPhoneCollectionWaitMs: CALLBACK_PHONE_COLLECTION_WAIT_MS,
     callbackPhoneSilenceTimeoutMs: CALLBACK_PHONE_SILENCE_TIMEOUT_MS,
+    callTransferEnabled: ENABLE_CALL_TRANSFER,
+    transferNumberConfigured: Boolean(TRANSFER_PHONE_NUMBER),
   });
 });
 
@@ -304,6 +328,7 @@ wss.on("connection", (ws) => {
   let interruptionHappened = false;
 
   let pendingHangupAfterMark = null;
+  let pendingTransferAfterMark = null;
   let callIsEnding = false;
 
   // Barge-in debounce.
@@ -594,6 +619,7 @@ wss.on("connection", (ws) => {
       clearCallbackPhoneCollectionTimer();
       clearPendingBargeInTimer();
       clearPendingVoicemailTimer();
+      pendingTransferAfterMark = null;
 
       await endOutboundCall(currentCallSid);
 
@@ -604,6 +630,86 @@ wss.on("connection", (ws) => {
       console.error("Error ending call:", error.message);
       addTranscriptLine("system", `Error ending call: ${error.message}`);
       await sendCallResultToRails("Error ending call");
+    }
+  }
+
+  async function transferCallNow(reason) {
+    try {
+      if (callIsEnding) {
+        return;
+      }
+
+      if (!ENABLE_CALL_TRANSFER) {
+        console.log("Call transfer is disabled. Ending call instead.");
+        await endCallNow("Transfer disabled");
+        return;
+      }
+
+      if (!TRANSFER_PHONE_NUMBER) {
+        console.log("TRANSFER_PHONE_NUMBER is missing. Ending call instead.");
+        await endCallNow("Transfer number missing");
+        return;
+      }
+
+      if (!TRANSFER_CALLER_ID) {
+        console.log("TRANSFER_CALLER_ID or TWILIO_PHONE_NUMBER is missing. Ending call instead.");
+        await endCallNow("Transfer caller ID missing");
+        return;
+      }
+
+      if (!twilioClient) {
+        console.log("Twilio credentials are missing. Ending call instead.");
+        await endCallNow("Transfer Twilio credentials missing");
+        return;
+      }
+
+      if (!currentCallSid) {
+        console.log("Cannot transfer call because callSid is missing.");
+        await endCallNow("Transfer failed, callSid missing");
+        return;
+      }
+
+      callIsEnding = true;
+
+      console.log("Transferring call:", {
+        reason,
+        callSid: currentCallSid,
+        transferPhoneNumber: TRANSFER_PHONE_NUMBER,
+      });
+
+      clearIntroTimer();
+      clearSilenceTimer();
+      clearCallbackPhoneCollectionTimer();
+      clearPendingBargeInTimer();
+      clearPendingVoicemailTimer();
+
+      try {
+        speechToText.close();
+      } catch (error) {
+        console.error("Error closing speech-to-text before transfer:", error.message);
+      }
+
+      const transferTwiml = `
+<Response>
+  <Dial callerId="${xmlEscape(TRANSFER_CALLER_ID)}" answerOnBridge="true" timeout="25">
+    <Number>${xmlEscape(TRANSFER_PHONE_NUMBER)}</Number>
+  </Dial>
+</Response>
+      `.trim();
+
+      await sendCallResultToRails(`Transferred call: ${reason}`);
+
+      await twilioClient.calls(currentCallSid).update({
+        twiml: transferTwiml,
+      });
+
+      console.log("Call transfer sent to Twilio");
+    } catch (error) {
+      console.error("Error transferring call:", error.message);
+      addTranscriptLine("system", `Error transferring call: ${error.message}`);
+
+      callIsEnding = false;
+      await endCallNow("Transfer failed");
     }
   }
 
@@ -906,6 +1012,40 @@ wss.on("connection", (ws) => {
     return false;
   }
 
+  function shouldTransferCallAfterReply({ cleanTranscript, sessionMemory, aiReply }) {
+    const lowerReply = String(aiReply || "").toLowerCase();
+
+    if (!ENABLE_CALL_TRANSFER) {
+      return false;
+    }
+
+    if (!TRANSFER_PHONE_NUMBER) {
+      return false;
+    }
+
+    if (sessionMemory.doNotCall) {
+      return false;
+    }
+
+    if (sessionMemory.isInterested === "no" && !sessionMemory.wantsCallback) {
+      return false;
+    }
+
+    if (transcriptSuggestsGoodbye(cleanTranscript)) {
+      return false;
+    }
+
+    if (
+      lowerReply.includes("put you through") ||
+      lowerReply.includes("transfer you") ||
+      lowerReply.includes("connect you")
+    ) {
+      return true;
+    }
+
+    return isLeadComplete(sessionMemory);
+  }
+
   async function processFinalCustomerTranscript(cleanTranscript) {
     console.log("Customer said:", cleanTranscript);
     addTranscriptLine("customer", cleanTranscript);
@@ -1027,7 +1167,7 @@ wss.on("connection", (ws) => {
 
       console.log("AI response started");
 
-      const aiReply = await getAIResponse({
+      let aiReply = await getAIResponse({
         transcript: cleanTranscript,
         conversationHistory,
         sessionMemory,
@@ -1054,6 +1194,22 @@ wss.on("connection", (ws) => {
         console.log("AI reply discarded because voicemail has been handled.");
         aiIsThinking = false;
         return;
+      }
+
+      const shouldHangUp = shouldEndCallAfterReply({
+        cleanTranscript,
+        sessionMemory,
+        aiReply,
+      });
+
+      const shouldTransfer = shouldTransferCallAfterReply({
+        cleanTranscript,
+        sessionMemory,
+        aiReply,
+      });
+
+      if (shouldTransfer && TRANSFER_MESSAGE) {
+        aiReply = TRANSFER_MESSAGE;
       }
 
       console.log("AI replied:", aiReply);
@@ -1088,17 +1244,16 @@ wss.on("connection", (ws) => {
       aiIsSpeaking = true;
       interruptionHappened = false;
 
-      const shouldHangUp = shouldEndCallAfterReply({
-        cleanTranscript,
-        sessionMemory,
-        aiReply,
-      });
-
       if (shouldHangUp) {
         resetCallbackPhoneCollection();
 
-        pendingHangupAfterMark = markName;
-        console.log("Call will end after AI finishes speaking:", markName);
+        if (shouldTransfer) {
+          pendingTransferAfterMark = markName;
+          console.log("Call will transfer after AI finishes speaking:", markName);
+        } else {
+          pendingHangupAfterMark = markName;
+          console.log("Call will end after AI finishes speaking:", markName);
+        }
       } else {
         if (aiReplyRequestsCallbackPhone(aiReply)) {
           awaitingCallbackPhone = true;
@@ -1361,6 +1516,12 @@ wss.on("connection", (ws) => {
           clearPendingBargeInTimer();
         }
 
+        if (finishedMarkName && finishedMarkName === pendingTransferAfterMark) {
+          pendingTransferAfterMark = null;
+          transferCallNow("Transfer message finished playing");
+          return;
+        }
+
         if (finishedMarkName && finishedMarkName === pendingHangupAfterMark) {
           pendingHangupAfterMark = null;
 
@@ -1392,6 +1553,7 @@ wss.on("connection", (ws) => {
         clearCallbackPhoneCollectionTimer();
         clearPendingBargeInTimer();
         clearPendingVoicemailTimer();
+        pendingTransferAfterMark = null;
         speechToText.close();
 
         console.log("Final session memory:", formatSessionMemoryForLog(sessionMemory));
@@ -1417,6 +1579,7 @@ wss.on("connection", (ws) => {
     clearCallbackPhoneCollectionTimer();
     clearPendingBargeInTimer();
     clearPendingVoicemailTimer();
+    pendingTransferAfterMark = null;
     speechToText.close();
 
     console.log("Twilio media stream disconnected", {
@@ -1434,6 +1597,7 @@ wss.on("connection", (ws) => {
     clearCallbackPhoneCollectionTimer();
     clearPendingBargeInTimer();
     clearPendingVoicemailTimer();
+    pendingTransferAfterMark = null;
     speechToText.close();
 
     console.error("WebSocket error:", error.message);
