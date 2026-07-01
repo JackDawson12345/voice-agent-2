@@ -1023,10 +1023,20 @@ wss.on("connection", (ws) => {
     const thisResponseId = ++responseGenerationId;
 
     try {
+      const responseStartedAt = Date.now();
+
+      console.log("AI response started");
+
       const aiReply = await getAIResponse({
         transcript: cleanTranscript,
         conversationHistory,
         sessionMemory,
+      });
+
+      const aiFinishedAt = Date.now();
+
+      console.log("AI response finished:", {
+        aiMs: aiFinishedAt - responseStartedAt,
       });
 
       if (!aiReply) {
@@ -1049,7 +1059,16 @@ wss.on("connection", (ws) => {
       console.log("AI replied:", aiReply);
       addTranscriptLine("assistant", aiReply);
 
+      console.log("TTS started");
+
+      const ttsStartedAt = Date.now();
       const aiAudio = await textToSpeech(aiReply);
+      const ttsFinishedAt = Date.now();
+
+      console.log("TTS finished:", {
+        ttsMs: ttsFinishedAt - ttsStartedAt,
+        totalMs: ttsFinishedAt - responseStartedAt,
+      });
 
       if (thisResponseId !== responseGenerationId) {
         console.log("AI audio discarded because customer interrupted.");
@@ -1228,7 +1247,7 @@ wss.on("connection", (ws) => {
   }
 
   const speechToText = createSpeechToTextStream({
-    onTranscript: async ({ transcript, isFinal, utteranceEnd }) => {
+    onTranscript: async ({ transcript, isFinal, speechFinal, utteranceEnd }) => {
       try {
         if (utteranceEnd) {
           return;
@@ -1275,7 +1294,7 @@ wss.on("connection", (ws) => {
         customerHasSpoken = true;
         clearIntroTimer();
 
-        if (!isFinal) {
+        if (!isFinal && !speechFinal) {
           return;
         }
 
