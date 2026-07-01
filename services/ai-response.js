@@ -60,10 +60,11 @@ Then ask whether they currently have a business.
 
 Callback details to collect:
 
+Business Type.
+Business name.
 Callback name.
 Callback phone number.
 Preferred callback time.
-Business name.
 
 Callback rules:
 

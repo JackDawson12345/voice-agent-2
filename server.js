@@ -24,10 +24,13 @@ const {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const DEFAULT_RAILS_PUBLIC_URL = "https://riverboat-canyon-expensive.ngrok-free.dev";
+const DEFAULT_RAILS_PUBLIC_URL =
+  "https://riverboat-canyon-expensive.ngrok-free.dev";
+
 const RAILS_PUBLIC_URL = (
   process.env.RAILS_PUBLIC_URL || DEFAULT_RAILS_PUBLIC_URL
 ).replace(/\/$/, "");
+
 const DEFAULT_RAILS_CALLBACK_URL = `${RAILS_PUBLIC_URL}/node-call-results`;
 
 app.use(express.json());
@@ -259,7 +262,12 @@ wss.on("connection", (ws) => {
   let introHasPlayed = false;
   let introTimer = null;
 
+  // iPhone call screening state.
   let callScreeningReplySent = false;
+
+  // Voicemail / answer machine state.
+  let voicemailHandled = false;
+  let pendingVoicemailTimer = null;
 
   // Barge-in state.
   let aiIsSpeaking = false;
@@ -343,7 +351,7 @@ wss.on("connection", (ws) => {
       try {
         introTimer = null;
 
-        if (customerHasSpoken || introHasPlayed) {
+        if (customerHasSpoken || introHasPlayed || voicemailHandled) {
           return;
         }
 
@@ -364,7 +372,11 @@ wss.on("connection", (ws) => {
         const thisResponseId = ++responseGenerationId;
         const introAudio = await textToSpeech(INTRO_MESSAGE);
 
-        if (customerHasSpoken || thisResponseId !== responseGenerationId) {
+        if (
+          customerHasSpoken ||
+          voicemailHandled ||
+          thisResponseId !== responseGenerationId
+        ) {
           console.log("Intro cancelled before playback");
           return;
         }
@@ -396,6 +408,186 @@ wss.on("connection", (ws) => {
       clearTimeout(introTimer);
       introTimer = null;
     }
+  }
+
+  function isIphoneCallScreeningPrompt(text) {
+    const lower = String(text || "").toLowerCase();
+
+    return (
+      lower.includes("record your name and reason") ||
+      lower.includes("if you record your name") ||
+      lower.includes("reason for calling") ||
+      lower.includes("i'll see if this person is available") ||
+      lower.includes("i will see if this person is available") ||
+      lower.includes("see if this person is available")
+    );
+  }
+
+  async function answerIphoneCallScreeningPrompt() {
+    if (callScreeningReplySent) {
+      return;
+    }
+
+    if (!currentStreamSid) {
+      console.log("Cannot answer call screening because streamSid is missing");
+      return;
+    }
+
+    callScreeningReplySent = true;
+    customerHasSpoken = true;
+
+    clearIntroTimer();
+
+    const screeningReply =
+      "Hi, this is Lily from Unitel Direct. I’m calling regarding a website package for local businesses.";
+
+    console.log("AI replied to iPhone call screening:", screeningReply);
+
+    addTranscriptLine("system", "iPhone call screening prompt detected");
+    addTranscriptLine("assistant", screeningReply);
+
+    const thisResponseId = ++responseGenerationId;
+    const screeningAudio = await textToSpeech(screeningReply);
+
+    if (thisResponseId !== responseGenerationId) {
+      console.log("Call screening reply cancelled");
+      return;
+    }
+
+    const markName = `call-screening-audio-${Date.now()}`;
+
+    activeAudioMark = markName;
+    aiIsSpeaking = true;
+    interruptionHappened = false;
+
+    sendAudioToTwilio(ws, currentStreamSid, screeningAudio, markName);
+
+    conversationHistory.push({
+      role: "assistant",
+      content: screeningReply,
+    });
+  }
+
+  function isVoicemailOrAnswerMachine(text) {
+    const lower = String(text || "").toLowerCase();
+
+    // Do not treat iPhone call screening as voicemail.
+    if (isIphoneCallScreeningPrompt(lower)) {
+      return false;
+    }
+
+    const voicemailPhrases = [
+      "please leave a message",
+      "leave a message after the tone",
+      "leave your message after the tone",
+      "after the tone",
+      "after the beep",
+      "record your message",
+      "you have reached the voicemail",
+      "you've reached the voicemail",
+      "you have reached",
+      "you've reached",
+      "i am unable to take your call",
+      "i'm unable to take your call",
+      "i can't take your call",
+      "i cannot take your call",
+      "sorry i missed your call",
+      "sorry we missed your call",
+      "no one is available",
+      "no one available",
+      "the person you are calling is unavailable",
+      "the person you're calling is unavailable",
+      "is not available right now",
+      "please leave your name and number",
+      "leave your name and number",
+      "mailbox",
+      "voicemail box",
+    ];
+
+    return voicemailPhrases.some((phrase) => lower.includes(phrase));
+  }
+
+  function clearPendingVoicemailTimer() {
+    if (pendingVoicemailTimer) {
+      clearTimeout(pendingVoicemailTimer);
+      pendingVoicemailTimer = null;
+    }
+  }
+
+  async function leaveVoicemailAndHangUp(detectedTranscript) {
+    if (voicemailHandled) {
+      return;
+    }
+
+    if (!currentStreamSid) {
+      console.log("Cannot leave voicemail because streamSid is missing");
+      return;
+    }
+
+    voicemailHandled = true;
+    customerHasSpoken = true;
+
+    clearIntroTimer();
+    clearPendingBargeInTimer();
+
+    // If Lily's intro has already started playing, stop it.
+    if (aiIsSpeaking) {
+      clearTwilioAudio(ws, currentStreamSid);
+      aiIsSpeaking = false;
+      activeAudioMark = null;
+    }
+
+    // Invalidate any AI/TTS response currently being generated.
+    responseGenerationId++;
+
+    addTranscriptLine("system", `Voicemail detected: ${detectedTranscript}`);
+
+    const voicemailMessage =
+      "Hi, this is Lily from Unitel Direct. I was calling regarding a website and SEO package for local businesses. Please feel free to call Unitel Direct back when convenient. Thank you.";
+
+    console.log("Leaving voicemail message:", voicemailMessage);
+
+    addTranscriptLine("assistant", voicemailMessage);
+
+    conversationHistory.push({
+      role: "assistant",
+      content: voicemailMessage,
+    });
+
+    const thisResponseId = ++responseGenerationId;
+
+    // Small delay so Lily does not speak over the voicemail tone.
+    pendingVoicemailTimer = setTimeout(async () => {
+      try {
+        pendingVoicemailTimer = null;
+
+        if (thisResponseId !== responseGenerationId) {
+          console.log("Voicemail message cancelled");
+          return;
+        }
+
+        const voicemailAudio = await textToSpeech(voicemailMessage);
+
+        if (thisResponseId !== responseGenerationId) {
+          console.log("Voicemail audio cancelled");
+          return;
+        }
+
+        const markName = `voicemail-audio-${Date.now()}`;
+
+        activeAudioMark = markName;
+        aiIsSpeaking = true;
+        pendingHangupAfterMark = markName;
+
+        console.log("Call will end after voicemail message:", markName);
+
+        sendAudioToTwilio(ws, currentStreamSid, voicemailAudio, markName);
+      } catch (error) {
+        console.error("Voicemail handling error:", error.message);
+        addTranscriptLine("system", `Voicemail handling error: ${error.message}`);
+        await endCallNow("Voicemail handling error");
+      }
+    }, 1200);
   }
 
   function transcriptSuggestsGoodbye(text) {
@@ -470,6 +662,10 @@ wss.on("connection", (ws) => {
         return;
       }
 
+      clearIntroTimer();
+      clearPendingBargeInTimer();
+      clearPendingVoicemailTimer();
+
       await endOutboundCall(currentCallSid);
 
       console.log("Call ended successfully");
@@ -483,6 +679,11 @@ wss.on("connection", (ws) => {
   }
 
   async function createAndPlayAIReply(cleanTranscript) {
+    if (voicemailHandled) {
+      console.log("Skipping AI reply because voicemail has already been handled.");
+      return;
+    }
+
     if (aiIsThinking && !interruptionHappened) {
       console.log("AI is already responding, skipping overlapping transcript.");
       return;
@@ -515,6 +716,12 @@ wss.on("connection", (ws) => {
         return;
       }
 
+      if (voicemailHandled) {
+        console.log("AI reply discarded because voicemail has been handled.");
+        aiIsThinking = false;
+        return;
+      }
+
       console.log("AI replied:", aiReply);
       addTranscriptLine("assistant", aiReply);
 
@@ -522,6 +729,12 @@ wss.on("connection", (ws) => {
 
       if (thisResponseId !== responseGenerationId) {
         console.log("AI audio discarded because customer interrupted.");
+        aiIsThinking = false;
+        return;
+      }
+
+      if (voicemailHandled) {
+        console.log("AI audio discarded because voicemail has been handled.");
         aiIsThinking = false;
         return;
       }
@@ -617,7 +830,11 @@ wss.on("connection", (ws) => {
       "could",
     ];
 
-    if (strongPhrases.some((phrase) => cleanText.toLowerCase().startsWith(phrase))) {
+    if (
+      strongPhrases.some((phrase) =>
+        cleanText.toLowerCase().startsWith(phrase)
+      )
+    ) {
       return true;
     }
 
@@ -639,6 +856,10 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    if (voicemailHandled) {
+      return;
+    }
+
     if (!looksLikeRealInterruption(cleanTranscript)) {
       return;
     }
@@ -653,6 +874,11 @@ wss.on("connection", (ws) => {
     // This makes interruption feel less harsh and filters out quick false starts.
     pendingBargeInTimer = setTimeout(() => {
       if (!aiIsSpeaking) {
+        clearPendingBargeInTimer();
+        return;
+      }
+
+      if (voicemailHandled) {
         clearPendingBargeInTimer();
         return;
       }
@@ -672,61 +898,6 @@ wss.on("connection", (ws) => {
     }, 250);
   }
 
-  function isIphoneCallScreeningPrompt(text) {
-  const lower = String(text || "").toLowerCase();
-
-  return (
-    lower.includes("record your name and reason") ||
-    lower.includes("if you record your name") ||
-    lower.includes("reason for calling") ||
-    lower.includes("i'll see if this person is available") ||
-    lower.includes("i will see if this person is available") ||
-    lower.includes("see if this person is available")
-  );
-}
-
-async function answerIphoneCallScreeningPrompt() {
-  if (callScreeningReplySent) {
-    return;
-  }
-
-  if (!currentStreamSid) {
-    console.log("Cannot answer call screening because streamSid is missing");
-    return;
-  }
-
-  callScreeningReplySent = true;
-
-  const screeningReply =
-    "Hi, this is Lily from Unitel Direct calling regarding a website package.";
-
-  console.log("AI replied to iPhone call screening:", screeningReply);
-
-  addTranscriptLine("system", "iPhone call screening prompt detected");
-  addTranscriptLine("assistant", screeningReply);
-
-  const thisResponseId = ++responseGenerationId;
-  const screeningAudio = await textToSpeech(screeningReply);
-
-  if (thisResponseId !== responseGenerationId) {
-    console.log("Call screening reply cancelled");
-    return;
-  }
-
-  const markName = `call-screening-audio-${Date.now()}`;
-
-  activeAudioMark = markName;
-  aiIsSpeaking = true;
-  interruptionHappened = false;
-
-  sendAudioToTwilio(ws, currentStreamSid, screeningAudio, markName);
-
-  conversationHistory.push({
-    role: "assistant",
-    content: screeningReply,
-  });
-}
-
   const speechToText = createSpeechToTextStream({
     onTranscript: async ({ transcript, isFinal, utteranceEnd }) => {
       try {
@@ -736,30 +907,38 @@ async function answerIphoneCallScreeningPrompt() {
 
         const cleanTranscript = transcript.trim();
 
-        if (cleanTranscript && isIphoneCallScreeningPrompt(cleanTranscript)) {
-          customerHasSpoken = true;
-          clearIntroTimer();
-
-          await answerIphoneCallScreeningPrompt();
-
+        if (!cleanTranscript) {
           return;
         }
 
-        // Barge-in: stop AI audio as soon as the customer starts speaking.
-        if (cleanTranscript && aiIsSpeaking) {
+        // 1. iPhone call screening comes first.
+        // This must not be treated as voicemail.
+        if (isIphoneCallScreeningPrompt(cleanTranscript)) {
+          await answerIphoneCallScreeningPrompt();
+          return;
+        }
+
+        // 2. Voicemail / answer machine comes second.
+        // This leaves one message, then hangs up.
+        if (isVoicemailOrAnswerMachine(cleanTranscript)) {
+          await leaveVoicemailAndHangUp(cleanTranscript);
+          return;
+        }
+
+        // If voicemail is already being handled, ignore further speech.
+        if (voicemailHandled) {
+          return;
+        }
+
+        // 3. Normal barge-in behaviour.
+        if (aiIsSpeaking) {
           scheduleBargeIn(cleanTranscript);
         }
 
-        if (cleanTranscript) {
-          customerHasSpoken = true;
-          clearIntroTimer();
-        }
+        customerHasSpoken = true;
+        clearIntroTimer();
 
         if (!isFinal) {
-          return;
-        }
-
-        if (!cleanTranscript) {
           return;
         }
 
@@ -861,7 +1040,12 @@ async function answerIphoneCallScreeningPrompt() {
 
         if (finishedMarkName && finishedMarkName === pendingHangupAfterMark) {
           pendingHangupAfterMark = null;
-          endCallNow("Final AI message finished playing");
+
+          if (voicemailHandled) {
+            endCallNow("Voicemail message finished playing");
+          } else {
+            endCallNow("Final AI message finished playing");
+          }
         }
       }
 
@@ -876,6 +1060,7 @@ async function answerIphoneCallScreeningPrompt() {
       if (data.event === "stop") {
         clearIntroTimer();
         clearPendingBargeInTimer();
+        clearPendingVoicemailTimer();
         speechToText.close();
 
         console.log("Final session memory:", formatSessionMemoryForLog(sessionMemory));
@@ -898,6 +1083,7 @@ async function answerIphoneCallScreeningPrompt() {
   ws.on("close", () => {
     clearIntroTimer();
     clearPendingBargeInTimer();
+    clearPendingVoicemailTimer();
     speechToText.close();
 
     console.log("Twilio media stream disconnected", {
@@ -912,6 +1098,7 @@ async function answerIphoneCallScreeningPrompt() {
   ws.on("error", (error) => {
     clearIntroTimer();
     clearPendingBargeInTimer();
+    clearPendingVoicemailTimer();
     speechToText.close();
 
     console.error("WebSocket error:", error.message);
