@@ -1013,38 +1013,64 @@ wss.on("connection", (ws) => {
   }
 
   function shouldTransferCallAfterReply({ cleanTranscript, sessionMemory, aiReply }) {
-    const lowerReply = String(aiReply || "").toLowerCase();
+  const lowerReply = String(aiReply || "").toLowerCase();
 
-    if (!ENABLE_CALL_TRANSFER) {
-      return false;
-    }
+  const debug = {
+    enableCallTransfer: ENABLE_CALL_TRANSFER,
+    transferPhoneNumberConfigured: Boolean(TRANSFER_PHONE_NUMBER),
+    doNotCall: sessionMemory.doNotCall,
+    isInterested: sessionMemory.isInterested,
+    wantsCallback: sessionMemory.wantsCallback,
+    callbackPhone: sessionMemory.callbackPhone,
+    callbackTime: sessionMemory.callbackTime,
+    leadComplete: isLeadComplete(sessionMemory),
+    customerSaidGoodbye: transcriptSuggestsGoodbye(cleanTranscript),
+  };
 
-    if (!TRANSFER_PHONE_NUMBER) {
-      return false;
-    }
+  console.log("Transfer decision check:", debug);
 
-    if (sessionMemory.doNotCall) {
-      return false;
-    }
-
-    if (sessionMemory.isInterested === "no" && !sessionMemory.wantsCallback) {
-      return false;
-    }
-
-    if (transcriptSuggestsGoodbye(cleanTranscript)) {
-      return false;
-    }
-
-    if (
-      lowerReply.includes("put you through") ||
-      lowerReply.includes("transfer you") ||
-      lowerReply.includes("connect you")
-    ) {
-      return true;
-    }
-
-    return isLeadComplete(sessionMemory);
+  if (!ENABLE_CALL_TRANSFER) {
+    console.log("Transfer decision: no, ENABLE_CALL_TRANSFER is false.");
+    return false;
   }
+
+  if (!TRANSFER_PHONE_NUMBER) {
+    console.log("Transfer decision: no, TRANSFER_PHONE_NUMBER is missing.");
+    return false;
+  }
+
+  if (sessionMemory.doNotCall) {
+    console.log("Transfer decision: no, customer asked not to be called.");
+    return false;
+  }
+
+  if (sessionMemory.isInterested === "no" && !sessionMemory.wantsCallback) {
+    console.log("Transfer decision: no, customer is not interested.");
+    return false;
+  }
+
+  if (transcriptSuggestsGoodbye(cleanTranscript)) {
+    console.log("Transfer decision: no, customer said goodbye.");
+    return false;
+  }
+
+  if (
+    lowerReply.includes("put you through") ||
+    lowerReply.includes("transfer you") ||
+    lowerReply.includes("connect you")
+  ) {
+    console.log("Transfer decision: yes, AI reply mentions transfer.");
+    return true;
+  }
+
+  if (isLeadComplete(sessionMemory)) {
+    console.log("Transfer decision: yes, lead is complete.");
+    return true;
+  }
+
+  console.log("Transfer decision: no, lead is not complete yet.");
+  return false;
+}
 
   async function processFinalCustomerTranscript(cleanTranscript) {
     console.log("Customer said:", cleanTranscript);
