@@ -996,13 +996,33 @@ wss.on("connection", (ws) => {
     );
   }
 
+  function replySuggestsTransfer(reply) {
+    const lowerReply = String(reply || "").toLowerCase();
+
+    return (
+      lowerReply.includes("put you through") ||
+      lowerReply.includes("transfer you") ||
+      lowerReply.includes("connect you") ||
+      lowerReply.includes("speak to someone") ||
+      lowerReply.includes("speak with someone")
+    );
+  }
+
+  function qualificationReadyForConsent(memory) {
+    return hasMinimumTransferDetails(memory);
+  }
+
+  function transferConsentQuestion() {
+    return "Perfect, I have enough details. Are you happy for me to put you through to someone now?";
+  }
+
   function hasCoreTransferDetails(memory) {
     // These are the details the agent needs before taking a warm transfer.
     // Customer name, exact business name, and main goal are useful, but should not
     // block the handover if speech-to-text misses them. A clear trade in the
     // business name, such as "Jack Dawson dog walking", is enough business context.
     return Boolean(
-      memory.isBusinessOwner === "yes" &&
+      (memory.isBusinessOwner === "yes" || hasUsefulBusinessContext(memory)) &&
         hasUsefulBusinessContext(memory) &&
         memory.timeInBusiness &&
         memory.hasCurrentWebsite &&
@@ -1113,11 +1133,7 @@ wss.on("connection", (ws) => {
       return false;
     }
 
-    const aiReplyMentionsTransfer =
-      lowerReply.includes("put you through") ||
-      lowerReply.includes("transfer you") ||
-      lowerReply.includes("connect you") ||
-      lowerReply.includes("speak to someone");
+    const aiReplyMentionsTransfer = replySuggestsTransfer(aiReply);
 
     if (sessionMemory.happyToTransfer === true) {
       console.log("Transfer decision: yes, lead is qualified and customer accepted transfer.");
@@ -1125,8 +1141,8 @@ wss.on("connection", (ws) => {
     }
 
     if (aiReplyMentionsTransfer) {
-      console.log("Transfer decision: yes, AI reply mentions transfer after qualification.");
-      return true;
+      console.log("Transfer decision: no, AI reply mentions transfer but customer transfer consent is not stored yet.");
+      return false;
     }
 
     console.log("Transfer decision: no, waiting for explicit transfer consent.");
@@ -1237,6 +1253,15 @@ wss.on("connection", (ws) => {
         console.log("AI reply discarded because voicemail has been handled.");
         aiIsThinking = false;
         return;
+      }
+
+      if (
+        qualificationReadyForConsent(sessionMemory) &&
+        sessionMemory.happyToTransfer !== true &&
+        replySuggestsTransfer(aiReply)
+      ) {
+        console.log("AI tried to transfer before stored consent, asking transfer consent instead.");
+        aiReply = transferConsentQuestion();
       }
 
       const shouldHangUp = shouldEndCallAfterReply({

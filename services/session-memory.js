@@ -62,6 +62,40 @@ function isSimpleNo(text) {
   return /^(no|nope|nah|not really|not at the moment|not now|i'?m not|we'?re not)\b/i.test(text);
 }
 
+function isAffirmativeAnswer(text) {
+  const lower = compactText(text)
+    .replace(/[.!?]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!lower) {
+    return false;
+  }
+
+  if (isSimpleYes(lower)) {
+    return true;
+  }
+
+  return /\b(yes|yeah|yep|yeh|sure|okay|ok|correct|that'?s right|go ahead|please do|happy to|i do|we do|i did|we did|i am|we are)\b/i.test(lower);
+}
+
+function isNegativeAnswer(text) {
+  const lower = compactText(text)
+    .replace(/[.!?]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!lower) {
+    return false;
+  }
+
+  if (isSimpleNo(lower)) {
+    return true;
+  }
+
+  return /\b(no|nope|nah|not now|not today|rather not|don'?t|do not|not interested)\b/i.test(lower);
+}
+
 function looksLikeMarketingProviderAnswer(text) {
   const lower = compactText(text);
 
@@ -357,6 +391,14 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     setField(memory, "businessType", inferredBusinessType, changedFields);
   }
 
+  if (
+    memory.isBusinessOwner !== "yes" &&
+    (assistantAskedBusinessName || assistantAskedBusinessType) &&
+    (memory.businessName || memory.businessType)
+  ) {
+    setField(memory, "isBusinessOwner", "yes", changedFields);
+  }
+
   const website = extractWebsite(rawText);
 
   if (website) {
@@ -378,7 +420,7 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
 
   if (assistantAskedBusinessOwner) {
     if (
-      isSimpleYes(lower) ||
+      isAffirmativeAnswer(lower) ||
       hasAny(lower, [
         "i do",
         "we do",
@@ -395,7 +437,7 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
       setField(memory, "isBusinessOwner", "yes", changedFields);
     }
 
-    if (isSimpleNo(lower) || hasAny(lower, ["i don't", "i do not", "we don't", "we do not"])) {
+    if (isNegativeAnswer(lower) || hasAny(lower, ["i don't", "i do not", "we don't", "we do not"])) {
       setField(memory, "isBusinessOwner", "no", changedFields);
       setField(memory, "isInterested", "no", changedFields);
     }
@@ -494,12 +536,12 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   }
 
   if (assistantAskedTransfer) {
-    if (isSimpleYes(lower) || hasAny(lower, ["put me through", "transfer me", "connect me", "that's fine", "that is fine"])) {
+    if (isAffirmativeAnswer(lower) || hasAny(lower, ["put me through", "transfer me", "connect me", "that's fine", "that is fine"])) {
       setField(memory, "happyToTransfer", true, changedFields);
       setField(memory, "isInterested", "yes", changedFields);
     }
 
-    if (isSimpleNo(lower) || hasAny(lower, ["not now", "not today", "don't transfer", "do not transfer", "rather not"])) {
+    if (isNegativeAnswer(lower) || hasAny(lower, ["not now", "not today", "don't transfer", "do not transfer", "rather not"])) {
       setField(memory, "happyToTransfer", false, changedFields);
     }
   }
