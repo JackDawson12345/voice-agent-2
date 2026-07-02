@@ -31,6 +31,13 @@ function compactText(value) {
   return cleanValue(value).toLowerCase();
 }
 
+function normaliseSpeechText(value) {
+  return cleanValue(value)
+    .replace(/[.!?]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function getLastAssistantMessage(conversationHistory = []) {
   for (let index = conversationHistory.length - 1; index >= 0; index -= 1) {
     const message = conversationHistory[index];
@@ -53,6 +60,30 @@ function isSimpleYes(text) {
 
 function isSimpleNo(text) {
   return /^(no|nope|nah|not really|not at the moment|not now|i'?m not|we'?re not)\b/i.test(text);
+}
+
+function looksLikeMarketingProviderAnswer(text) {
+  const lower = compactText(text);
+
+  const mentionsMarketing = hasAny(lower, [
+    "seo",
+    "search engine",
+    "google",
+    "ads",
+    "adwords",
+    "ppc",
+    "marketing",
+    "online marketing",
+    "social media",
+    "facebook ads",
+    "agency",
+  ]);
+
+  const soundsLikeTheyHaveSomething =
+    /^(yes|yeah|yep|yeh|we|i|they|have|got|using|use|with|currently|already|some|a bit of|paying|paid)\b/i.test(lower) ||
+    hasAny(lower, [" have some", " got some", " use ", " using ", " with "]);
+
+  return mentionsMarketing && soundsLikeTheyHaveSomething;
 }
 
 function extractWebsite(text) {
@@ -116,7 +147,9 @@ function pushNote(memory, note, changedFields) {
 function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   const changedFields = [];
   const rawText = cleanValue(transcript);
+  const speechText = normaliseSpeechText(rawText);
   const lower = rawText.toLowerCase();
+  const speechLower = speechText.toLowerCase();
   const lastAssistant = getLastAssistantMessage(context.conversationHistory || []);
   const lastAssistantLower = lastAssistant.toLowerCase();
 
@@ -142,6 +175,8 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
 
   const assistantAskedBusinessOwner = hasAny(lastAssistantLower, [
     "run, own, or manage",
+    "run, own or manage",
+    "own or manage",
     "run or own",
     "have a business",
     "currently run",
@@ -208,6 +243,7 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
 
   const assistantAskedTransfer = hasAny(lastAssistantLower, [
     "put you through",
+    "happy for me to put",
     "transfer you",
     "connect you",
     "speak to someone",
@@ -215,12 +251,18 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     "member of the team",
   ]);
 
-  const explicitCustomerName = extractAfterPatterns(rawText, [
-    /(?:my name is|this is)\s+([a-z][a-z .'-]{1,50})$/i,
-  ]);
+  const explicitCustomerName =
+    extractAfterPatterns(speechText, [
+      /(?:my name is|this is|i am|i'm)\s+([a-z][a-z .'-]{1,50})$/i,
+      /(?:hello|hi|hiya)?\s*([a-z][a-z .'-]{1,50})\s+(?:speaking|here)$/i,
+    ]) ||
+    extractAfterPatterns(rawText, [
+      /(?:my name is|this is|i am|i'm)\s+([a-z][a-z .'-]{1,50})$/i,
+      /(?:hello|hi|hiya)?[\s,.]*([a-z][a-z .'-]{1,50})\s+(?:speaking|here)$/i,
+    ]);
 
   const customerNameFromAnswer = assistantAskedCustomerName
-    ? extractAfterPatterns(rawText, [
+    ? extractAfterPatterns(speechText, [
         /(?:my name is|i am|i'm|this is|it is|it's)\s+([a-z][a-z .'-]{1,50})$/i,
       ])
     : null;
@@ -240,7 +282,25 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   if (businessName && !assistantAskedBusinessType) {
     setField(memory, "businessName", businessName, changedFields);
   } else if (assistantAskedBusinessName && !isSimpleYes(lower) && !isSimpleNo(lower)) {
-    setField(memory, "businessName", rawText, changedFields);
+    const sameAsCustomerName =
+      memory.customerName && compactText(rawText) === compactText(memory.customerName);
+
+    const looksLikeOnlyBusinessType = hasAny(compactText(rawText), [
+      "walking",
+      "marketing",
+      "telecoms",
+      "plumbing",
+      "roofing",
+      "cleaning",
+      "landscaping",
+    ]) && rawText.split(/\s+/).length === 1;
+
+    // If the caller repeats only their own name or gives one generic trade word,
+    // avoid treating that as a reliable business name. The AI can ask once more,
+    // but the transfer will not be blocked forever if the rest of the lead is good.
+    if (!sameAsCustomerName && !looksLikeOnlyBusinessType) {
+      setField(memory, "businessName", rawText, changedFields);
+    }
   }
 
   const website = extractWebsite(rawText);
@@ -263,7 +323,21 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   }
 
   if (assistantAskedBusinessOwner) {
-    if (isSimpleYes(lower) || hasAny(lower, ["i do", "we do", "i run", "i own", "we run", "we own"])) {
+    if (
+      isSimpleYes(lower) ||
+      hasAny(lower, [
+        "i do",
+        "we do",
+        "i did",
+        "we did",
+        "i run",
+        "i own",
+        "i manage",
+        "we run",
+        "we own",
+        "we manage",
+      ])
+    ) {
       setField(memory, "isBusinessOwner", "yes", changedFields);
     }
 
@@ -303,17 +377,35 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   }
 
   if (assistantAskedSeo) {
-    if (isSimpleYes(lower) || hasAny(lower, ["we do", "i do", "we have", "i have", "already have seo", "got seo"])) {
+    if (
+      isSimpleYes(lower) ||
+      hasAny(lower, [
+        "we do",
+        "i do",
+        "we have",
+        "i have",
+        "have some",
+        "got some",
+        "already have seo",
+        "got seo",
+        "using seo",
+        "using marketing",
+        "with a marketing",
+        "with an agency",
+      ]) ||
+      looksLikeMarketingProviderAnswer(rawText)
+    ) {
       setField(memory, "hasCurrentSeoPackage", "yes", changedFields);
+
       if (!isSimpleYes(lower)) {
         setField(memory, "currentSeoProvider", rawText, changedFields);
       }
     }
 
-    if (isSimpleNo(lower) || hasAny(lower, ["no seo", "don't have seo", "do not have seo", "not doing seo", "no marketing package"])) {
+    if (isSimpleNo(lower) || hasAny(lower, ["no seo", "don't have seo", "do not have seo", "not doing seo", "no marketing package", "nothing at the moment", "not currently"])) {
       setField(memory, "hasCurrentSeoPackage", "no", changedFields);
     }
-  } else if (hasAny(lower, ["already have seo", "got seo", "we do seo", "have a marketing package"])) {
+  } else if (hasAny(lower, ["already have seo", "got seo", "we do seo", "have a marketing package"]) || looksLikeMarketingProviderAnswer(rawText)) {
     setField(memory, "hasCurrentSeoPackage", "yes", changedFields);
     setField(memory, "currentSeoProvider", rawText, changedFields);
   } else if (hasAny(lower, ["no seo", "don't have seo", "do not have seo", "not doing seo", "no marketing package"])) {
@@ -330,6 +422,9 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
       "more leads",
       "better rankings",
       "rank higher",
+      "search visibility",
+      "visibility",
+      "online visibility",
       "more local work",
       "new website",
       "better website",

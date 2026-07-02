@@ -53,6 +53,9 @@ const TRANSFER_CALLER_ID =
 const TRANSFER_MESSAGE =
   process.env.TRANSFER_MESSAGE ||
   "Perfect, I have enough details. I’ll put you through to someone now.";
+const TRANSFER_FALLBACK_DELAY_MS = Number(
+  process.env.TRANSFER_FALLBACK_DELAY_MS || 7000
+);
 const ENABLE_CALL_TRANSFER = process.env.ENABLE_CALL_TRANSFER !== "false";
 
 const twilioClient =
@@ -118,6 +121,7 @@ app.get("/health", (req, res) => {
     silenceTimeoutMs: SILENCE_TIMEOUT_MS,
     callTransferEnabled: ENABLE_CALL_TRANSFER,
     transferNumberConfigured: Boolean(TRANSFER_PHONE_NUMBER),
+    transferFallbackDelayMs: TRANSFER_FALLBACK_DELAY_MS,
   });
 });
 
@@ -315,6 +319,8 @@ wss.on("connection", (ws) => {
 
   let pendingHangupAfterMark = null;
   let pendingTransferAfterMark = null;
+  let pendingTransferFallbackTimer = null;
+  let transferInProgressReason = null;
   let callIsEnding = false;
 
   // Barge-in debounce.
@@ -402,6 +408,13 @@ wss.on("connection", (ws) => {
     }
   }
 
+  function clearPendingTransferFallbackTimer() {
+    if (pendingTransferFallbackTimer) {
+      clearTimeout(pendingTransferFallbackTimer);
+      pendingTransferFallbackTimer = null;
+    }
+  }
+
   function clearPendingBargeInTimer() {
     if (pendingBargeInTimer) {
       clearTimeout(pendingBargeInTimer);
@@ -409,6 +422,31 @@ wss.on("connection", (ws) => {
     }
 
     pendingBargeInTranscript = "";
+  }
+
+  function schedulePendingTransferFallback(markName) {
+    clearPendingTransferFallbackTimer();
+
+    if (!markName) {
+      return;
+    }
+
+    pendingTransferFallbackTimer = setTimeout(() => {
+      pendingTransferFallbackTimer = null;
+
+      if (callIsEnding) {
+        return;
+      }
+
+      if (pendingTransferAfterMark !== markName) {
+        return;
+      }
+
+      pendingTransferAfterMark = null;
+
+      console.log("Transfer fallback triggered because Twilio mark was not received:", markName);
+      transferCallNow("Transfer fallback after AI message");
+    }, TRANSFER_FALLBACK_DELAY_MS);
   }
 
   function cancelActiveAudioTracking() {
@@ -568,6 +606,7 @@ wss.on("connection", (ws) => {
       clearSilenceTimer();
       clearPendingBargeInTimer();
       clearPendingVoicemailTimer();
+      clearPendingTransferFallbackTimer();
       pendingTransferAfterMark = null;
 
       await endOutboundCall(currentCallSid);
@@ -619,23 +658,21 @@ wss.on("connection", (ws) => {
       }
 
       callIsEnding = true;
+      transferInProgressReason = reason;
 
       console.log("Transferring call:", {
         reason,
         callSid: currentCallSid,
         transferPhoneNumber: TRANSFER_PHONE_NUMBER,
+        callerId: TRANSFER_CALLER_ID,
       });
 
       clearIntroTimer();
       clearSilenceTimer();
       clearPendingBargeInTimer();
       clearPendingVoicemailTimer();
-
-      try {
-        speechToText.close();
-      } catch (error) {
-        console.error("Error closing speech-to-text before transfer:", error.message);
-      }
+      clearPendingTransferFallbackTimer();
+      pendingTransferAfterMark = null;
 
       const transferTwiml = `
 <Response>
@@ -645,18 +682,27 @@ wss.on("connection", (ws) => {
 </Response>
       `.trim();
 
-      await sendCallResultToRails(`Transferred call: ${reason}`);
-
+      // Send the Twilio redirect first. Do not wait for Rails before transferring,
+      // otherwise a slow Rails callback can make the customer hear silence.
       await twilioClient.calls(currentCallSid).update({
         twiml: transferTwiml,
       });
 
       console.log("Call transfer sent to Twilio");
+
+      try {
+        speechToText.close();
+      } catch (error) {
+        console.error("Error closing speech-to-text after transfer:", error.message);
+      }
+
+      await sendCallResultToRails(`Transferred call: ${reason}`);
     } catch (error) {
       console.error("Error transferring call:", error.message);
       addTranscriptLine("system", `Error transferring call: ${error.message}`);
 
       callIsEnding = false;
+      transferInProgressReason = null;
       await endCallNow("Transfer failed");
     }
   }
@@ -917,14 +963,15 @@ wss.on("connection", (ws) => {
   }
 
   function hasMinimumTransferDetails(memory) {
+    // Keep transfer practical. We still ask for customer name and business name,
+    // but do not block a live handover forever if speech-to-text misses them.
     return Boolean(
       memory.isBusinessOwner === "yes" &&
-        memory.customerName &&
-        memory.businessName &&
         memory.businessType &&
         memory.timeInBusiness &&
         memory.hasCurrentWebsite &&
-        memory.hasCurrentSeoPackage
+        memory.hasCurrentSeoPackage &&
+        memory.mainGoal
     );
   }
 
@@ -976,6 +1023,8 @@ wss.on("connection", (ws) => {
       timeInBusiness: sessionMemory.timeInBusiness,
       hasCurrentWebsite: sessionMemory.hasCurrentWebsite,
       hasCurrentSeoPackage: sessionMemory.hasCurrentSeoPackage,
+      currentSeoProvider: sessionMemory.currentSeoProvider,
+      mainGoal: sessionMemory.mainGoal,
       minimumDetailsReady: hasMinimumTransferDetails(sessionMemory),
       leadComplete: isLeadComplete(sessionMemory),
       customerSaidGoodbye: transcriptSuggestsGoodbye(cleanTranscript),
@@ -1198,8 +1247,12 @@ wss.on("connection", (ws) => {
       interruptionHappened = false;
 
       if (shouldTransfer) {
-          pendingTransferAfterMark = markName;
-        console.log("Call will transfer after AI finishes speaking:", markName);
+        pendingTransferAfterMark = markName;
+        schedulePendingTransferFallback(markName);
+        console.log("Call will transfer after AI finishes speaking:", {
+          markName,
+          fallbackDelayMs: TRANSFER_FALLBACK_DELAY_MS,
+        });
       } else if (shouldHangUp) {
           pendingHangupAfterMark = markName;
         console.log("Call will end after AI finishes speaking:", markName);
@@ -1450,6 +1503,7 @@ wss.on("connection", (ws) => {
 
         if (finishedMarkName && finishedMarkName === pendingTransferAfterMark) {
           pendingTransferAfterMark = null;
+          clearPendingTransferFallbackTimer();
           transferCallNow("Transfer message finished playing");
           return;
         }
@@ -1484,6 +1538,7 @@ wss.on("connection", (ws) => {
         clearSilenceTimer();
           clearPendingBargeInTimer();
         clearPendingVoicemailTimer();
+        clearPendingTransferFallbackTimer();
         pendingTransferAfterMark = null;
         speechToText.close();
 
@@ -1495,7 +1550,11 @@ wss.on("connection", (ws) => {
           totalAudioPackets: audioPacketCount,
         });
 
-        sendCallResultToRails("Twilio media stream stopped");
+        sendCallResultToRails(
+          transferInProgressReason
+            ? `Transferred call: ${transferInProgressReason}`
+            : "Twilio media stream stopped"
+        );
       }
     } catch (error) {
       console.error("Error reading media stream message:", error.message);
@@ -1509,6 +1568,7 @@ wss.on("connection", (ws) => {
     clearSilenceTimer();
     clearPendingBargeInTimer();
     clearPendingVoicemailTimer();
+    clearPendingTransferFallbackTimer();
     pendingTransferAfterMark = null;
     speechToText.close();
 
@@ -1518,7 +1578,11 @@ wss.on("connection", (ws) => {
       totalAudioPackets: audioPacketCount,
     });
 
-    sendCallResultToRails("Twilio media stream disconnected");
+    sendCallResultToRails(
+      transferInProgressReason
+        ? `Transferred call: ${transferInProgressReason}`
+        : "Twilio media stream disconnected"
+    );
   });
 
   ws.on("error", (error) => {
@@ -1526,12 +1590,17 @@ wss.on("connection", (ws) => {
     clearSilenceTimer();
     clearPendingBargeInTimer();
     clearPendingVoicemailTimer();
+    clearPendingTransferFallbackTimer();
     pendingTransferAfterMark = null;
     speechToText.close();
 
     console.error("WebSocket error:", error.message);
     addTranscriptLine("system", `WebSocket error: ${error.message}`);
-    sendCallResultToRails("WebSocket error");
+    sendCallResultToRails(
+      transferInProgressReason
+        ? `Transferred call: ${transferInProgressReason}`
+        : "WebSocket error"
+    );
   });
 });
 

@@ -42,9 +42,9 @@ Ask for the next missing item in this exact order unless the customer has alread
 9. What they would most like to improve online.
 10. Whether they are happy to be put through to a member of the team now.
 
-Do not skip the business name.
+Do not skip the business name, but if the customer has already given useful business context and avoids the name once, move on rather than getting stuck.
 Do not skip the SEO or online marketing question, even if they do not currently have a website.
-Only ask for transfer consent after items 1 to 9 are known.
+Only ask for transfer consent after items 1 to 9 are known. Keep the transfer consent question clear, for example: ‘Are you happy for me to put you through to someone now?’
 
 Package details:
 
@@ -153,7 +153,7 @@ Important:
 Do not ask for a known fact again.
 Ask for the next missing detail using the qualification order.
 Do not collect callback details.
-Do not ask whether they are happy to be transferred until the business name, business type, time in business, website status, SEO or online marketing status, and main online goal are known.
+Do not ask whether they are happy to be transferred until the business type, time in business, website status, SEO or online marketing status, and main online goal are known. Try to collect customer name and business name too, but do not let a missed name stop the flow.
 If the customer has agreed to be transferred and the qualification details are complete, give a short transfer confirmation.
 `.trim(),
     },
