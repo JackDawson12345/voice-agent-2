@@ -962,13 +962,48 @@ wss.on("connection", (ws) => {
     );
   }
 
+  function hasUsefulBusinessContext(memory) {
+    if (memory.businessType) {
+      return true;
+    }
+
+    if (!memory.businessName) {
+      return false;
+    }
+
+    const words = String(memory.businessName).trim().split(/\s+/).filter(Boolean);
+    const lowerBusinessName = String(memory.businessName).toLowerCase();
+
+    return (
+      words.length >= 2 &&
+      [
+        "walking",
+        "marketing",
+        "telecom",
+        "telecoms",
+        "plumbing",
+        "roofing",
+        "cleaning",
+        "landscaping",
+        "building",
+        "construction",
+        "electrical",
+        "carpentry",
+        "joinery",
+        "salon",
+        "beauty",
+      ].some((word) => lowerBusinessName.includes(word))
+    );
+  }
+
   function hasCoreTransferDetails(memory) {
     // These are the details the agent needs before taking a warm transfer.
-    // Customer name, business name, and main goal are useful, but should not
-    // block the handover if speech-to-text misses them.
+    // Customer name, exact business name, and main goal are useful, but should not
+    // block the handover if speech-to-text misses them. A clear trade in the
+    // business name, such as "Jack Dawson dog walking", is enough business context.
     return Boolean(
       memory.isBusinessOwner === "yes" &&
-        memory.businessType &&
+        hasUsefulBusinessContext(memory) &&
         memory.timeInBusiness &&
         memory.hasCurrentWebsite &&
         memory.hasCurrentSeoPackage
@@ -1024,6 +1059,7 @@ wss.on("connection", (ws) => {
       customerName: sessionMemory.customerName,
       businessName: sessionMemory.businessName,
       businessType: sessionMemory.businessType,
+      hasUsefulBusinessContext: hasUsefulBusinessContext(sessionMemory),
       timeInBusiness: sessionMemory.timeInBusiness,
       hasCurrentWebsite: sessionMemory.hasCurrentWebsite,
       hasCurrentSeoPackage: sessionMemory.hasCurrentSeoPackage,

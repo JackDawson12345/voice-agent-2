@@ -94,6 +94,38 @@ function looksLikeMarketingProviderAnswer(text) {
   return mentionsMarketing && soundsLikeTheyHaveSomething;
 }
 
+function inferBusinessTypeFromText(text) {
+  const lower = compactText(text);
+
+  if (!lower) {
+    return null;
+  }
+
+  const mappings = [
+    { phrases: ["dog walking", "dog walker", "pet walking"], value: "dog walking business" },
+    { phrases: ["pet care", "pet sitting", "dog sitting"], value: "pet care business" },
+    { phrases: ["marketing", "seo", "social media", "digital"], value: "marketing business" },
+    { phrases: ["telecom", "telecoms", "telecommunications"], value: "telecoms business" },
+    { phrases: ["plumbing", "plumber"], value: "plumbing business" },
+    { phrases: ["roofing", "roofer"], value: "roofing business" },
+    { phrases: ["cleaning", "cleaner"], value: "cleaning business" },
+    { phrases: ["landscaping", "landscape gardener", "gardening"], value: "landscaping business" },
+    { phrases: ["building", "builder", "construction"], value: "building business" },
+    { phrases: ["electrical", "electrician"], value: "electrical business" },
+    { phrases: ["carpentry", "carpenter", "joinery"], value: "carpentry business" },
+    { phrases: ["hair", "barber", "beauty", "salon"], value: "hair and beauty business" },
+    { phrases: ["restaurant", "cafe", "takeaway"], value: "hospitality business" },
+  ];
+
+  for (const mapping of mappings) {
+    if (mapping.phrases.some((phrase) => lower.includes(phrase))) {
+      return mapping.value;
+    }
+  }
+
+  return null;
+}
+
 function extractWebsite(text) {
   const match = String(text || "").match(
     /((https?:\/\/)?(www\.)?[a-z0-9-]+(\.[a-z]{2,}){1,3}(\/[\w\-.~:/?#[\]@!$&'()*+,;=%]*)?)/i
@@ -317,6 +349,12 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     if (!sameAsCustomerName && !looksLikeOnlyBusinessType) {
       setField(memory, "businessName", rawText, changedFields);
     }
+  }
+
+  const inferredBusinessType = inferBusinessTypeFromText(rawText) || inferBusinessTypeFromText(memory.businessName);
+
+  if (!memory.businessType && inferredBusinessType) {
+    setField(memory, "businessType", inferredBusinessType, changedFields);
   }
 
   const website = extractWebsite(rawText);
