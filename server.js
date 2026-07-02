@@ -962,22 +962,26 @@ wss.on("connection", (ws) => {
     );
   }
 
-  function hasMinimumTransferDetails(memory) {
-    // Keep transfer practical. We still ask for customer name and business name,
-    // but do not block a live handover forever if speech-to-text misses them.
+  function hasCoreTransferDetails(memory) {
+    // These are the details the agent needs before taking a warm transfer.
+    // Customer name, business name, and main goal are useful, but should not
+    // block the handover if speech-to-text misses them.
     return Boolean(
       memory.isBusinessOwner === "yes" &&
         memory.businessType &&
         memory.timeInBusiness &&
         memory.hasCurrentWebsite &&
-        memory.hasCurrentSeoPackage &&
-        memory.mainGoal
+        memory.hasCurrentSeoPackage
     );
+  }
+
+  function hasMinimumTransferDetails(memory) {
+    return Boolean(hasCoreTransferDetails(memory));
   }
 
   function isLeadComplete(memory) {
     return Boolean(
-      hasMinimumTransferDetails(memory) &&
+      hasCoreTransferDetails(memory) &&
         memory.isInterested === "yes" &&
         memory.happyToTransfer === true
     );
@@ -1025,6 +1029,7 @@ wss.on("connection", (ws) => {
       hasCurrentSeoPackage: sessionMemory.hasCurrentSeoPackage,
       currentSeoProvider: sessionMemory.currentSeoProvider,
       mainGoal: sessionMemory.mainGoal,
+      coreDetailsReady: hasCoreTransferDetails(sessionMemory),
       minimumDetailsReady: hasMinimumTransferDetails(sessionMemory),
       leadComplete: isLeadComplete(sessionMemory),
       customerSaidGoodbye: transcriptSuggestsGoodbye(cleanTranscript),

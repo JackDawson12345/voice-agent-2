@@ -75,7 +75,15 @@ function looksLikeMarketingProviderAnswer(text) {
     "marketing",
     "online marketing",
     "social media",
+    "facebook",
     "facebook ads",
+    "instagram",
+    "meta",
+    "tiktok",
+    "linkedin",
+    "yell",
+    "checkatrade",
+    "trustatrader",
     "agency",
   ]);
 
@@ -279,7 +287,15 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     /(?:business is called|company is called|business name is|company name is|my business is|my company is|we are called|we're called|it is called|it's called|called)\s+(.{2,80})$/i,
   ]);
 
-  if (businessName && !assistantAskedBusinessType) {
+  const businessNameFromDirectAnswer = assistantAskedBusinessName
+    ? extractAfterPatterns(rawText, [
+        /^(?:it is|it's|this is|that is|that's)\s+(.{2,80})$/i,
+      ])
+    : null;
+
+  if ((businessName || businessNameFromDirectAnswer) && !assistantAskedBusinessType) {
+    setField(memory, "businessName", businessName || businessNameFromDirectAnswer, changedFields);
+  } else if (businessName && !assistantAskedBusinessType) {
     setField(memory, "businessName", businessName, changedFields);
   } else if (assistantAskedBusinessName && !isSimpleYes(lower) && !isSimpleNo(lower)) {
     const sameAsCustomerName =
