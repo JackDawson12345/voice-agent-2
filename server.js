@@ -38,7 +38,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
 const INTRO_MESSAGE =
-  "Hello, this is Lily from Unitel Direct. I was just calling to ask a quick question about your website and online enquiries. Is now an okay time?";
+  "Hello, this is Lily from Unitel Direct. I was just calling briefly about your business, website and online enquiries. Is now an okay time?";
 
 const SILENCE_CHECK_MESSAGE =
   process.env.SILENCE_CHECK_MESSAGE || "Hello, are you still there?";
@@ -47,19 +47,12 @@ const INTRO_DELAY_MS = Number(process.env.INTRO_DELAY_MS || 2000);
 const SILENCE_TIMEOUT_MS = Number(process.env.SILENCE_TIMEOUT_MS || 8000);
 const MAX_SILENCE_CHECKS = Number(process.env.MAX_SILENCE_CHECKS || 1);
 
-const CALLBACK_PHONE_COLLECTION_WAIT_MS = Number(
-  process.env.CALLBACK_PHONE_COLLECTION_WAIT_MS || 5000
-);
-
-const CALLBACK_PHONE_SILENCE_TIMEOUT_MS = Number(
-  process.env.CALLBACK_PHONE_SILENCE_TIMEOUT_MS || 16000
-);
-
 const TRANSFER_PHONE_NUMBER = process.env.TRANSFER_PHONE_NUMBER || "";
 const TRANSFER_CALLER_ID =
   process.env.TRANSFER_CALLER_ID || process.env.TWILIO_PHONE_NUMBER || "";
 const TRANSFER_MESSAGE =
-  process.env.TRANSFER_MESSAGE || "Perfect, I’ll put you through to someone now.";
+  process.env.TRANSFER_MESSAGE ||
+  "Perfect, I have enough details. I’ll put you through to someone now.";
 const ENABLE_CALL_TRANSFER = process.env.ENABLE_CALL_TRANSFER !== "false";
 
 const twilioClient =
@@ -123,8 +116,6 @@ app.get("/health", (req, res) => {
     message: "Backend is running",
     railsCallbackUrl: DEFAULT_RAILS_CALLBACK_URL,
     silenceTimeoutMs: SILENCE_TIMEOUT_MS,
-    callbackPhoneCollectionWaitMs: CALLBACK_PHONE_COLLECTION_WAIT_MS,
-    callbackPhoneSilenceTimeoutMs: CALLBACK_PHONE_SILENCE_TIMEOUT_MS,
     callTransferEnabled: ENABLE_CALL_TRANSFER,
     transferNumberConfigured: Boolean(TRANSFER_PHONE_NUMBER),
   });
@@ -309,11 +300,6 @@ wss.on("connection", (ws) => {
   let silenceCheckCount = 0;
   const silenceWatchMarks = new Set();
 
-  // Callback phone number collection state.
-  let awaitingCallbackPhone = false;
-  let callbackPhoneBuffer = [];
-  let callbackPhoneCollectionTimer = null;
-
   // iPhone call screening state.
   let callScreeningReplySent = false;
 
@@ -409,35 +395,6 @@ wss.on("connection", (ws) => {
     }
   }
 
-  function clearCallbackPhoneCollectionTimer() {
-    if (callbackPhoneCollectionTimer) {
-      clearTimeout(callbackPhoneCollectionTimer);
-      callbackPhoneCollectionTimer = null;
-    }
-  }
-
-  function clearPendingVoicemailTimer() {
-    if (pendingVoicemailTimer) {
-      clearTimeout(pendingVoicemailTimer);
-      pendingVoicemailTimer = null;
-    }
-  }
-
-  function clearPendingBargeInTimer() {
-    if (pendingBargeInTimer) {
-      clearTimeout(pendingBargeInTimer);
-      pendingBargeInTimer = null;
-    }
-
-    pendingBargeInTranscript = "";
-  }
-
-  function resetCallbackPhoneCollection() {
-    awaitingCallbackPhone = false;
-    callbackPhoneBuffer = [];
-    clearCallbackPhoneCollectionTimer();
-  }
-
   function cancelActiveAudioTracking() {
     if (activeAudioMark) {
       silenceWatchMarks.delete(activeAudioMark);
@@ -456,28 +413,7 @@ wss.on("connection", (ws) => {
   }
 
   function getCurrentSilenceTimeoutMs() {
-    if (awaitingCallbackPhone) {
-      return CALLBACK_PHONE_SILENCE_TIMEOUT_MS;
-    }
-
     return SILENCE_TIMEOUT_MS;
-  }
-
-  function aiReplyRequestsCallbackPhone(aiReply) {
-    const lower = String(aiReply || "").toLowerCase();
-
-    return (
-      lower.includes("best phone number") ||
-      lower.includes("best number") ||
-      lower.includes("phone number for") ||
-      lower.includes("number for them to call") ||
-      lower.includes("number to call you") ||
-      lower.includes("call you on") ||
-      lower.includes("callback number") ||
-      lower.includes("mobile number") ||
-      lower.includes("rest of the number") ||
-      lower.includes("rest of your number")
-    );
   }
 
   function startSilenceTimer() {
@@ -509,7 +445,6 @@ wss.on("connection", (ws) => {
     console.log("Silence timer started:", {
       timeoutMs,
       silenceCheckCount,
-      awaitingCallbackPhone,
     });
   }
 
@@ -531,7 +466,6 @@ wss.on("connection", (ws) => {
     console.log("Silence timeout reached:", {
       silenceCheckCount,
       maxSilenceChecks: MAX_SILENCE_CHECKS,
-      awaitingCallbackPhone,
     });
 
     if (silenceCheckCount <= MAX_SILENCE_CHECKS) {
@@ -616,7 +550,6 @@ wss.on("connection", (ws) => {
 
       clearIntroTimer();
       clearSilenceTimer();
-      clearCallbackPhoneCollectionTimer();
       clearPendingBargeInTimer();
       clearPendingVoicemailTimer();
       pendingTransferAfterMark = null;
@@ -679,7 +612,6 @@ wss.on("connection", (ws) => {
 
       clearIntroTimer();
       clearSilenceTimer();
-      clearCallbackPhoneCollectionTimer();
       clearPendingBargeInTimer();
       clearPendingVoicemailTimer();
 
@@ -805,7 +737,6 @@ wss.on("connection", (ws) => {
 
     clearIntroTimer();
     clearSilenceTimer();
-    resetCallbackPhoneCollection();
 
     const screeningReply =
       "Hi, this is Lily from Unitel Direct. I’m calling regarding a website package for local businesses.";
@@ -893,7 +824,6 @@ wss.on("connection", (ws) => {
 
     clearIntroTimer();
     clearSilenceTimer();
-    resetCallbackPhoneCollection();
     clearPendingBargeInTimer();
 
     // If Lily's intro has already started playing, stop it.
@@ -970,18 +900,27 @@ wss.on("connection", (ws) => {
     );
   }
 
-  function isLeadComplete(memory) {
+  function hasMinimumTransferDetails(memory) {
     return Boolean(
-      memory.isInterested === "yes" &&
-        memory.wantsCallback &&
-        memory.callbackPhone &&
-        memory.callbackTime
+      memory.isBusinessOwner === "yes" &&
+        memory.customerName &&
+        memory.businessName &&
+        memory.businessType &&
+        memory.timeInBusiness &&
+        memory.hasCurrentWebsite &&
+        memory.hasCurrentSeoPackage
     );
   }
 
-  function shouldEndCallAfterReply({ cleanTranscript, sessionMemory, aiReply }) {
-    const lowerReply = String(aiReply || "").toLowerCase();
+  function isLeadComplete(memory) {
+    return Boolean(
+      hasMinimumTransferDetails(memory) &&
+        memory.isInterested === "yes" &&
+        memory.happyToTransfer === true
+    );
+  }
 
+  function shouldEndCallAfterReply({ cleanTranscript, sessionMemory }) {
     if (sessionMemory.doNotCall) {
       return true;
     }
@@ -990,87 +929,103 @@ wss.on("connection", (ws) => {
       return true;
     }
 
-    if (sessionMemory.isInterested === "no" && !sessionMemory.wantsCallback) {
+    if (sessionMemory.isBusinessOwner === "no") {
       return true;
     }
 
-    if (isLeadComplete(sessionMemory)) {
-      const replySoundsFinal =
-        lowerReply.includes("we'll call") ||
-        lowerReply.includes("we will call") ||
-        lowerReply.includes("call you") ||
-        lowerReply.includes("thanks") ||
-        lowerReply.includes("thank you") ||
-        lowerReply.includes("goodbye") ||
-        lowerReply.includes("bye");
+    if (sessionMemory.isInterested === "no" && sessionMemory.happyToTransfer !== true) {
+      return true;
+    }
 
-      if (replySoundsFinal) {
-        return true;
-      }
+    if (sessionMemory.happyToTransfer === false) {
+      return true;
     }
 
     return false;
   }
 
   function shouldTransferCallAfterReply({ cleanTranscript, sessionMemory, aiReply }) {
-  const lowerReply = String(aiReply || "").toLowerCase();
+    const lowerReply = String(aiReply || "").toLowerCase();
 
-  const debug = {
-    enableCallTransfer: ENABLE_CALL_TRANSFER,
-    transferPhoneNumberConfigured: Boolean(TRANSFER_PHONE_NUMBER),
-    doNotCall: sessionMemory.doNotCall,
-    isInterested: sessionMemory.isInterested,
-    wantsCallback: sessionMemory.wantsCallback,
-    callbackPhone: sessionMemory.callbackPhone,
-    callbackTime: sessionMemory.callbackTime,
-    leadComplete: isLeadComplete(sessionMemory),
-    customerSaidGoodbye: transcriptSuggestsGoodbye(cleanTranscript),
-  };
+    const debug = {
+      enableCallTransfer: ENABLE_CALL_TRANSFER,
+      transferPhoneNumberConfigured: Boolean(TRANSFER_PHONE_NUMBER),
+      doNotCall: sessionMemory.doNotCall,
+      isBusinessOwner: sessionMemory.isBusinessOwner,
+      isInterested: sessionMemory.isInterested,
+      happyToTransfer: sessionMemory.happyToTransfer,
+      customerName: sessionMemory.customerName,
+      businessName: sessionMemory.businessName,
+      businessType: sessionMemory.businessType,
+      timeInBusiness: sessionMemory.timeInBusiness,
+      hasCurrentWebsite: sessionMemory.hasCurrentWebsite,
+      hasCurrentSeoPackage: sessionMemory.hasCurrentSeoPackage,
+      minimumDetailsReady: hasMinimumTransferDetails(sessionMemory),
+      leadComplete: isLeadComplete(sessionMemory),
+      customerSaidGoodbye: transcriptSuggestsGoodbye(cleanTranscript),
+    };
 
-  console.log("Transfer decision check:", debug);
+    console.log("Transfer decision check:", debug);
 
-  if (!ENABLE_CALL_TRANSFER) {
-    console.log("Transfer decision: no, ENABLE_CALL_TRANSFER is false.");
+    if (!ENABLE_CALL_TRANSFER) {
+      console.log("Transfer decision: no, ENABLE_CALL_TRANSFER is false.");
+      return false;
+    }
+
+    if (!TRANSFER_PHONE_NUMBER) {
+      console.log("Transfer decision: no, TRANSFER_PHONE_NUMBER is missing.");
+      return false;
+    }
+
+    if (sessionMemory.doNotCall) {
+      console.log("Transfer decision: no, customer asked not to be called.");
+      return false;
+    }
+
+    if (sessionMemory.isBusinessOwner === "no") {
+      console.log("Transfer decision: no, customer does not have a business.");
+      return false;
+    }
+
+    if (sessionMemory.isInterested === "no") {
+      console.log("Transfer decision: no, customer is not interested.");
+      return false;
+    }
+
+    if (sessionMemory.happyToTransfer === false) {
+      console.log("Transfer decision: no, customer declined the transfer.");
+      return false;
+    }
+
+    if (transcriptSuggestsGoodbye(cleanTranscript)) {
+      console.log("Transfer decision: no, customer said goodbye.");
+      return false;
+    }
+
+    if (!hasMinimumTransferDetails(sessionMemory)) {
+      console.log("Transfer decision: no, qualification details are not complete yet.");
+      return false;
+    }
+
+    const aiReplyMentionsTransfer =
+      lowerReply.includes("put you through") ||
+      lowerReply.includes("transfer you") ||
+      lowerReply.includes("connect you") ||
+      lowerReply.includes("speak to someone");
+
+    if (sessionMemory.happyToTransfer === true) {
+      console.log("Transfer decision: yes, lead is qualified and customer accepted transfer.");
+      return true;
+    }
+
+    if (aiReplyMentionsTransfer) {
+      console.log("Transfer decision: yes, AI reply mentions transfer after qualification.");
+      return true;
+    }
+
+    console.log("Transfer decision: no, waiting for explicit transfer consent.");
     return false;
   }
-
-  if (!TRANSFER_PHONE_NUMBER) {
-    console.log("Transfer decision: no, TRANSFER_PHONE_NUMBER is missing.");
-    return false;
-  }
-
-  if (sessionMemory.doNotCall) {
-    console.log("Transfer decision: no, customer asked not to be called.");
-    return false;
-  }
-
-  if (sessionMemory.isInterested === "no" && !sessionMemory.wantsCallback) {
-    console.log("Transfer decision: no, customer is not interested.");
-    return false;
-  }
-
-  if (transcriptSuggestsGoodbye(cleanTranscript)) {
-    console.log("Transfer decision: no, customer said goodbye.");
-    return false;
-  }
-
-  if (
-    lowerReply.includes("put you through") ||
-    lowerReply.includes("transfer you") ||
-    lowerReply.includes("connect you")
-  ) {
-    console.log("Transfer decision: yes, AI reply mentions transfer.");
-    return true;
-  }
-
-  if (isLeadComplete(sessionMemory)) {
-    console.log("Transfer decision: yes, lead is complete.");
-    return true;
-  }
-
-  console.log("Transfer decision: no, lead is not complete yet.");
-  return false;
-}
 
   async function processFinalCustomerTranscript(cleanTranscript) {
     console.log("Customer said:", cleanTranscript);
@@ -1078,7 +1033,8 @@ wss.on("connection", (ws) => {
 
     const memoryUpdate = updateSessionMemoryFromTranscript(
       sessionMemory,
-      cleanTranscript
+      cleanTranscript,
+      { conversationHistory }
     );
 
     if (memoryUpdate.changedFields.length) {
@@ -1089,7 +1045,6 @@ wss.on("connection", (ws) => {
     }
 
     if (sessionMemory.doNotCall) {
-      resetCallbackPhoneCollection();
 
       const doNotCallReply =
         "I understand. Sorry for disturbing you, we will not call again. Thank you, goodbye.";
@@ -1122,50 +1077,6 @@ wss.on("connection", (ws) => {
     }
 
     await createAndPlayAIReply(cleanTranscript);
-  }
-
-  function queueCallbackPhoneTranscript(cleanTranscript) {
-    clearSilenceTimer();
-    clearCallbackPhoneCollectionTimer();
-
-    silenceCheckCount = 0;
-
-    callbackPhoneBuffer.push(cleanTranscript);
-
-    console.log("Collecting callback phone number transcript:", {
-      currentPart: cleanTranscript,
-      fullBuffer: callbackPhoneBuffer,
-      waitMs: CALLBACK_PHONE_COLLECTION_WAIT_MS,
-    });
-
-    callbackPhoneCollectionTimer = setTimeout(async () => {
-      try {
-        callbackPhoneCollectionTimer = null;
-
-        const combinedTranscript = callbackPhoneBuffer
-          .join(" ")
-          .replace(/\s+/g, " ")
-          .trim();
-
-        callbackPhoneBuffer = [];
-        awaitingCallbackPhone = false;
-
-        if (!combinedTranscript) {
-          return;
-        }
-
-        console.log("Callback phone number transcript ready:", combinedTranscript);
-
-        await processFinalCustomerTranscript(combinedTranscript);
-      } catch (error) {
-        console.error("Callback phone collection error:", error.message);
-        addTranscriptLine(
-          "system",
-          `Callback phone collection error: ${error.message}`
-        );
-        await endCallNow("Callback phone collection error");
-      }
-    }, CALLBACK_PHONE_COLLECTION_WAIT_MS);
   }
 
   async function createAndPlayAIReply(cleanTranscript) {
@@ -1270,28 +1181,14 @@ wss.on("connection", (ws) => {
       aiIsSpeaking = true;
       interruptionHappened = false;
 
-      if (shouldHangUp) {
-        resetCallbackPhoneCollection();
-
-        if (shouldTransfer) {
+      if (shouldTransfer) {
           pendingTransferAfterMark = markName;
-          console.log("Call will transfer after AI finishes speaking:", markName);
-        } else {
+        console.log("Call will transfer after AI finishes speaking:", markName);
+      } else if (shouldHangUp) {
           pendingHangupAfterMark = markName;
-          console.log("Call will end after AI finishes speaking:", markName);
-        }
+        console.log("Call will end after AI finishes speaking:", markName);
       } else {
-        if (aiReplyRequestsCallbackPhone(aiReply)) {
-          awaitingCallbackPhone = true;
-          callbackPhoneBuffer = [];
-          clearCallbackPhoneCollectionTimer();
-
-          console.log("Lily is now waiting for the callback phone number.");
-        } else {
-          resetCallbackPhoneCollection();
-        }
-
-        markShouldStartSilenceTimer(markName);
+          markShouldStartSilenceTimer(markName);
       }
 
       sendAudioToTwilio(ws, currentStreamSid, aiAudio, markName);
@@ -1448,8 +1345,7 @@ wss.on("connection", (ws) => {
         // This must not be treated as voicemail.
         if (isIphoneCallScreeningPrompt(cleanTranscript)) {
           silenceCheckCount = 0;
-          resetCallbackPhoneCollection();
-          await answerIphoneCallScreeningPrompt();
+              await answerIphoneCallScreeningPrompt();
           return;
         }
 
@@ -1457,8 +1353,7 @@ wss.on("connection", (ws) => {
         // This leaves one message, then hangs up.
         if (isVoicemailOrAnswerMachine(cleanTranscript)) {
           silenceCheckCount = 0;
-          resetCallbackPhoneCollection();
-          await leaveVoicemailAndHangUp(cleanTranscript);
+              await leaveVoicemailAndHangUp(cleanTranscript);
           return;
         }
 
@@ -1485,11 +1380,6 @@ wss.on("connection", (ws) => {
 
         lastFinalTranscript = cleanTranscript;
         silenceCheckCount = 0;
-
-        if (awaitingCallbackPhone) {
-          queueCallbackPhoneTranscript(cleanTranscript);
-          return;
-        }
 
         await processFinalCustomerTranscript(cleanTranscript);
       } catch (error) {
@@ -1576,8 +1466,7 @@ wss.on("connection", (ws) => {
       if (data.event === "stop") {
         clearIntroTimer();
         clearSilenceTimer();
-        clearCallbackPhoneCollectionTimer();
-        clearPendingBargeInTimer();
+          clearPendingBargeInTimer();
         clearPendingVoicemailTimer();
         pendingTransferAfterMark = null;
         speechToText.close();
@@ -1602,7 +1491,6 @@ wss.on("connection", (ws) => {
   ws.on("close", () => {
     clearIntroTimer();
     clearSilenceTimer();
-    clearCallbackPhoneCollectionTimer();
     clearPendingBargeInTimer();
     clearPendingVoicemailTimer();
     pendingTransferAfterMark = null;
@@ -1620,7 +1508,6 @@ wss.on("connection", (ws) => {
   ws.on("error", (error) => {
     clearIntroTimer();
     clearSilenceTimer();
-    clearCallbackPhoneCollectionTimer();
     clearPendingBargeInTimer();
     clearPendingVoicemailTimer();
     pendingTransferAfterMark = null;
