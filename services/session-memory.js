@@ -159,9 +159,13 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   const assistantAskedBusinessName = hasAny(lastAssistantLower, [
     "business name",
     "company name",
+    "name of the business",
+    "name of your business",
     "what is it called",
     "what's it called",
     "what is your business called",
+    "what's your business called",
+    "what is the business called",
   ]);
 
   const assistantAskedBusinessType = hasAny(lastAssistantLower, [
@@ -211,18 +215,26 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     "member of the team",
   ]);
 
-  const customerName = extractAfterPatterns(rawText, [
-    /(?:my name is|i am|i'm|this is|it is|it's)\s+([a-z][a-z .'-]{1,50})$/i,
+  const explicitCustomerName = extractAfterPatterns(rawText, [
+    /(?:my name is|this is)\s+([a-z][a-z .'-]{1,50})$/i,
   ]);
 
-  if (customerName && !hasAny(customerName.toLowerCase(), ["not", "calling", "business"])) {
+  const customerNameFromAnswer = assistantAskedCustomerName
+    ? extractAfterPatterns(rawText, [
+        /(?:my name is|i am|i'm|this is|it is|it's)\s+([a-z][a-z .'-]{1,50})$/i,
+      ])
+    : null;
+
+  const customerName = explicitCustomerName || customerNameFromAnswer;
+
+  if (customerName && !hasAny(customerName.toLowerCase(), ["not", "calling", "business", "website", "seo", "marketing", "telecoms", "internet"])) {
     setField(memory, "customerName", customerName, changedFields);
   } else if (assistantAskedCustomerName && !isSimpleYes(lower) && !isSimpleNo(lower)) {
     setField(memory, "customerName", rawText, changedFields);
   }
 
   const businessName = extractAfterPatterns(rawText, [
-    /(?:business is called|company is called|business name is|company name is|my business is|my company is|called)\s+(.{2,80})$/i,
+    /(?:business is called|company is called|business name is|company name is|my business is|my company is|we are called|we're called|it is called|it's called|called)\s+(.{2,80})$/i,
   ]);
 
   if (businessName && !assistantAskedBusinessType) {

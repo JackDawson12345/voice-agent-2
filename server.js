@@ -395,6 +395,22 @@ wss.on("connection", (ws) => {
     }
   }
 
+  function clearPendingVoicemailTimer() {
+    if (pendingVoicemailTimer) {
+      clearTimeout(pendingVoicemailTimer);
+      pendingVoicemailTimer = null;
+    }
+  }
+
+  function clearPendingBargeInTimer() {
+    if (pendingBargeInTimer) {
+      clearTimeout(pendingBargeInTimer);
+      pendingBargeInTimer = null;
+    }
+
+    pendingBargeInTranscript = "";
+  }
+
   function cancelActiveAudioTracking() {
     if (activeAudioMark) {
       silenceWatchMarks.delete(activeAudioMark);

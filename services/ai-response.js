@@ -28,6 +28,24 @@ Whether they currently have SEO, Google marketing, or another online marketing p
 What they would most like to improve online, such as more enquiries, better rankings, a new website, or more local visibility.
 Whether they are happy to be put through to a member of the team now.
 
+Qualification order:
+
+Ask for the next missing item in this exact order unless the customer has already provided it:
+1. Whether they run, own, or manage a business.
+2. Customer name.
+3. Business name.
+4. Business type.
+5. How long they have been in business.
+6. Whether they currently have a website.
+7. If they have a website, the website address if they know it.
+8. Whether they currently have SEO, Google marketing, or another online marketing package.
+9. What they would most like to improve online.
+10. Whether they are happy to be put through to a member of the team now.
+
+Do not skip the business name.
+Do not skip the SEO or online marketing question, even if they do not currently have a website.
+Only ask for transfer consent after items 1 to 9 are known.
+
 Package details:
 
 Unitel Direct provides landing page websites designed to generate enquiries.
@@ -133,8 +151,9 @@ ${memorySummary}
 
 Important:
 Do not ask for a known fact again.
-Only ask for the next missing detail.
+Ask for the next missing detail using the qualification order.
 Do not collect callback details.
+Do not ask whether they are happy to be transferred until the business name, business type, time in business, website status, SEO or online marketing status, and main online goal are known.
 If the customer has agreed to be transferred and the qualification details are complete, give a short transfer confirmation.
 `.trim(),
     },
