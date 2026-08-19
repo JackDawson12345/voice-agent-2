@@ -14,7 +14,9 @@ function createSessionMemory() {
     mainGoal: null,
     extraNotes: [],
     isInterested: null,
-    happyToTransfer: null,
+    happyForCallback: null,
+    callbackRequested: null,
+    callbackConfirmed: false,
     doNotCall: false,
     lastUpdatedAt: null,
   };
@@ -244,7 +246,7 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   ) {
     setField(memory, "doNotCall", true, changedFields);
     setField(memory, "isInterested", "no", changedFields);
-    setField(memory, "happyToTransfer", false, changedFields);
+    setField(memory, "happyForCallback", false, changedFields);
   }
 
   const assistantAskedBusinessOwner = hasAny(lastAssistantLower, [
@@ -315,13 +317,11 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     "what would you like",
   ]);
 
-  const assistantAskedTransfer = hasAny(lastAssistantLower, [
-    "put you through",
-    "happy for me to put",
-    "transfer you",
-    "connect you",
-    "speak to someone",
-    "speak with someone",
+  const assistantAskedCallback = hasAny(lastAssistantLower, [
+    "call back",
+    "callback",
+    "contact you",
+    "someone from the team",
     "member of the team",
   ]);
 
@@ -379,7 +379,7 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
 
     // If the caller repeats only their own name or gives one generic trade word,
     // avoid treating that as a reliable business name. The AI can ask once more,
-    // but the transfer will not be blocked forever if the rest of the lead is good.
+    // but the callback offer will not be blocked forever if the rest of the lead is good.
     if (!sameAsCustomerName && !looksLikeOnlyBusinessType) {
       setField(memory, "businessName", rawText, changedFields);
     }
@@ -535,14 +535,23 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     }
   }
 
-  if (assistantAskedTransfer) {
-    if (isAffirmativeAnswer(lower) || hasAny(lower, ["put me through", "transfer me", "connect me", "that's fine", "that is fine"])) {
-      setField(memory, "happyToTransfer", true, changedFields);
+  if (assistantAskedCallback) {
+    if (
+      isAffirmativeAnswer(lower) ||
+      hasAny(lower, [
+        "callback",
+        "call back",
+        "give me a call",
+        "someone call me",
+        "contact me",
+      ])
+    ) {
+      setField(memory, "happyForCallback", true, changedFields);
+      setField(memory, "callbackRequested", true, changedFields);
       setField(memory, "isInterested", "yes", changedFields);
-    }
-
-    if (isNegativeAnswer(lower) || hasAny(lower, ["not now", "not today", "don't transfer", "do not transfer", "rather not"])) {
-      setField(memory, "happyToTransfer", false, changedFields);
+    } else if (isNegativeAnswer(lower)) {
+      setField(memory, "happyForCallback", false, changedFields);
+      setField(memory, "callbackRequested", false, changedFields);
     }
   }
 
@@ -575,7 +584,7 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     ])
   ) {
     setField(memory, "isInterested", "no", changedFields);
-    setField(memory, "happyToTransfer", false, changedFields);
+    setField(memory, "happyForCallback", false, changedFields);
   }
 
   if (changedFields.length) {
@@ -619,7 +628,7 @@ function formatSessionMemoryForPrompt(memory) {
     `Main online goal: ${formatValue(memory.mainGoal)}`,
     `Extra notes: ${formatValue(memory.extraNotes)}`,
     `Interested: ${formatValue(memory.isInterested)}`,
-    `Happy to transfer now: ${formatValue(memory.happyToTransfer)}`,
+    `Happy for a callback: ${formatValue(memory.happyForCallback)}`,
     `Do not call: ${formatValue(memory.doNotCall)}`,
   ].join("\n");
 }
@@ -638,7 +647,9 @@ function formatSessionMemoryForLog(memory) {
     mainGoal: memory.mainGoal,
     extraNotes: memory.extraNotes,
     isInterested: memory.isInterested,
-    happyToTransfer: memory.happyToTransfer,
+    happyForCallback: memory.happyForCallback,
+    callbackRequested: memory.callbackRequested,
+    callbackConfirmed: memory.callbackConfirmed,
     doNotCall: memory.doNotCall,
     lastUpdatedAt: memory.lastUpdatedAt,
   };

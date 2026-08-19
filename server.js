@@ -47,21 +47,11 @@ const INTRO_DELAY_MS = Number(process.env.INTRO_DELAY_MS || 2000);
 const SILENCE_TIMEOUT_MS = Number(process.env.SILENCE_TIMEOUT_MS || 8000);
 const MAX_SILENCE_CHECKS = Number(process.env.MAX_SILENCE_CHECKS || 1);
 
-const TRANSFER_PHONE_NUMBER = process.env.TRANSFER_PHONE_NUMBER || "";
-const TRANSFER_CALLER_ID =
-  process.env.TRANSFER_CALLER_ID || process.env.TWILIO_PHONE_NUMBER || "";
-const TRANSFER_MESSAGE =
-  process.env.TRANSFER_MESSAGE ||
-  "Perfect, I have enough details. I’ll put you through to someone now.";
-const TRANSFER_FALLBACK_DELAY_MS = Number(
-  process.env.TRANSFER_FALLBACK_DELAY_MS || 7000
-);
-const ENABLE_CALL_TRANSFER = process.env.ENABLE_CALL_TRANSFER !== "false";
-
-const twilioClient =
-  process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
-    ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
-    : null;
+// Live transfer removed. Callback flow only.
+const CALLBACK_CONFIRMATION_MESSAGE =
+  process.env.CALLBACK_CONFIRMATION_MESSAGE ||
+  "Perfect, I’ll pass your details over and someone from the team will give you a call back.";
+const ENABLE_CALLBACK_FLOW = true;
 
 function xmlEscape(value) {
   return String(value || "")
@@ -119,9 +109,7 @@ app.get("/health", (req, res) => {
     message: "Backend is running",
     railsCallbackUrl: DEFAULT_RAILS_CALLBACK_URL,
     silenceTimeoutMs: SILENCE_TIMEOUT_MS,
-    callTransferEnabled: ENABLE_CALL_TRANSFER,
-    transferNumberConfigured: Boolean(TRANSFER_PHONE_NUMBER),
-    transferFallbackDelayMs: TRANSFER_FALLBACK_DELAY_MS,
+    callbackFlowEnabled: ENABLE_CALLBACK_FLOW,
   });
 });
 
@@ -318,9 +306,7 @@ wss.on("connection", (ws) => {
   let interruptionHappened = false;
 
   let pendingHangupAfterMark = null;
-  let pendingTransferAfterMark = null;
-  let pendingTransferFallbackTimer = null;
-  let transferInProgressReason = null;
+  let callEndReason = null;
   let callIsEnding = false;
 
   // Barge-in debounce.
@@ -408,13 +394,6 @@ wss.on("connection", (ws) => {
     }
   }
 
-  function clearPendingTransferFallbackTimer() {
-    if (pendingTransferFallbackTimer) {
-      clearTimeout(pendingTransferFallbackTimer);
-      pendingTransferFallbackTimer = null;
-    }
-  }
-
   function clearPendingBargeInTimer() {
     if (pendingBargeInTimer) {
       clearTimeout(pendingBargeInTimer);
@@ -422,31 +401,6 @@ wss.on("connection", (ws) => {
     }
 
     pendingBargeInTranscript = "";
-  }
-
-  function schedulePendingTransferFallback(markName) {
-    clearPendingTransferFallbackTimer();
-
-    if (!markName) {
-      return;
-    }
-
-    pendingTransferFallbackTimer = setTimeout(() => {
-      pendingTransferFallbackTimer = null;
-
-      if (callIsEnding) {
-        return;
-      }
-
-      if (pendingTransferAfterMark !== markName) {
-        return;
-      }
-
-      pendingTransferAfterMark = null;
-
-      console.log("Transfer fallback triggered because Twilio mark was not received:", markName);
-      transferCallNow("Transfer fallback after AI message");
-    }, TRANSFER_FALLBACK_DELAY_MS);
   }
 
   function cancelActiveAudioTracking() {
@@ -594,6 +548,7 @@ wss.on("connection", (ws) => {
       }
 
       callIsEnding = true;
+      callEndReason = reason;
 
       console.log("Ending call:", reason);
 
@@ -606,8 +561,6 @@ wss.on("connection", (ws) => {
       clearSilenceTimer();
       clearPendingBargeInTimer();
       clearPendingVoicemailTimer();
-      clearPendingTransferFallbackTimer();
-      pendingTransferAfterMark = null;
 
       await endOutboundCall(currentCallSid);
 
@@ -618,92 +571,6 @@ wss.on("connection", (ws) => {
       console.error("Error ending call:", error.message);
       addTranscriptLine("system", `Error ending call: ${error.message}`);
       await sendCallResultToRails("Error ending call");
-    }
-  }
-
-  async function transferCallNow(reason) {
-    try {
-      if (callIsEnding) {
-        return;
-      }
-
-      if (!ENABLE_CALL_TRANSFER) {
-        console.log("Call transfer is disabled. Ending call instead.");
-        await endCallNow("Transfer disabled");
-        return;
-      }
-
-      if (!TRANSFER_PHONE_NUMBER) {
-        console.log("TRANSFER_PHONE_NUMBER is missing. Ending call instead.");
-        await endCallNow("Transfer number missing");
-        return;
-      }
-
-      if (!TRANSFER_CALLER_ID) {
-        console.log("TRANSFER_CALLER_ID or TWILIO_PHONE_NUMBER is missing. Ending call instead.");
-        await endCallNow("Transfer caller ID missing");
-        return;
-      }
-
-      if (!twilioClient) {
-        console.log("Twilio credentials are missing. Ending call instead.");
-        await endCallNow("Transfer Twilio credentials missing");
-        return;
-      }
-
-      if (!currentCallSid) {
-        console.log("Cannot transfer call because callSid is missing.");
-        await endCallNow("Transfer failed, callSid missing");
-        return;
-      }
-
-      callIsEnding = true;
-      transferInProgressReason = reason;
-
-      console.log("Transferring call:", {
-        reason,
-        callSid: currentCallSid,
-        transferPhoneNumber: TRANSFER_PHONE_NUMBER,
-        callerId: TRANSFER_CALLER_ID,
-      });
-
-      clearIntroTimer();
-      clearSilenceTimer();
-      clearPendingBargeInTimer();
-      clearPendingVoicemailTimer();
-      clearPendingTransferFallbackTimer();
-      pendingTransferAfterMark = null;
-
-      const transferTwiml = `
-<Response>
-  <Dial callerId="${xmlEscape(TRANSFER_CALLER_ID)}" answerOnBridge="true" timeout="25">
-    <Number>${xmlEscape(TRANSFER_PHONE_NUMBER)}</Number>
-  </Dial>
-</Response>
-      `.trim();
-
-      // Send the Twilio redirect first. Do not wait for Rails before transferring,
-      // otherwise a slow Rails callback can make the customer hear silence.
-      await twilioClient.calls(currentCallSid).update({
-        twiml: transferTwiml,
-      });
-
-      console.log("Call transfer sent to Twilio");
-
-      try {
-        speechToText.close();
-      } catch (error) {
-        console.error("Error closing speech-to-text after transfer:", error.message);
-      }
-
-      await sendCallResultToRails(`Transferred call: ${reason}`);
-    } catch (error) {
-      console.error("Error transferring call:", error.message);
-      addTranscriptLine("system", `Error transferring call: ${error.message}`);
-
-      callIsEnding = false;
-      transferInProgressReason = null;
-      await endCallNow("Transfer failed");
     }
   }
 
@@ -996,7 +863,10 @@ wss.on("connection", (ws) => {
     );
   }
 
-  function replySuggestsTransfer(reply) {
+  // If the AI ever slips and offers to "put you through" or "transfer" the
+  // customer, we intercept it and steer the conversation back to arranging
+  // a callback instead. Live transfer is not supported.
+  function aiReplySuggestsHandoff(reply) {
     const lowerReply = String(reply || "").toLowerCase();
 
     return (
@@ -1009,17 +879,17 @@ wss.on("connection", (ws) => {
   }
 
   function qualificationReadyForConsent(memory) {
-    return hasMinimumTransferDetails(memory);
+    return hasCoreCallbackDetails(memory);
   }
 
-  function transferConsentQuestion() {
-    return "Perfect, I have enough details. Are you happy for me to put you through to someone now?";
+  function callbackConsentQuestion() {
+    return "Perfect, I have enough details. Would you like me to arrange for someone from the team to give you a call back?";
   }
 
-  function hasCoreTransferDetails(memory) {
-    // These are the details the agent needs before taking a warm transfer.
+  function hasCoreCallbackDetails(memory) {
+    // These are the details the agent needs before offering a callback.
     // Customer name, exact business name, and main goal are useful, but should not
-    // block the handover if speech-to-text misses them. A clear trade in the
+    // block the callback offer if speech-to-text misses them. A clear trade in the
     // business name, such as "Jack Dawson dog walking", is enough business context.
     return Boolean(
       (memory.isBusinessOwner === "yes" || hasUsefulBusinessContext(memory)) &&
@@ -1030,15 +900,11 @@ wss.on("connection", (ws) => {
     );
   }
 
-  function hasMinimumTransferDetails(memory) {
-    return Boolean(hasCoreTransferDetails(memory));
-  }
-
   function isLeadComplete(memory) {
     return Boolean(
-      hasCoreTransferDetails(memory) &&
+      hasCoreCallbackDetails(memory) &&
         memory.isInterested === "yes" &&
-        memory.happyToTransfer === true
+        memory.happyForCallback === true
     );
   }
 
@@ -1055,97 +921,14 @@ wss.on("connection", (ws) => {
       return true;
     }
 
-    if (sessionMemory.isInterested === "no" && sessionMemory.happyToTransfer !== true) {
+    if (sessionMemory.isInterested === "no" && sessionMemory.happyForCallback !== true) {
       return true;
     }
 
-    if (sessionMemory.happyToTransfer === false) {
+    if (sessionMemory.happyForCallback === false) {
       return true;
     }
 
-    return false;
-  }
-
-  function shouldTransferCallAfterReply({ cleanTranscript, sessionMemory, aiReply }) {
-    const lowerReply = String(aiReply || "").toLowerCase();
-
-    const debug = {
-      enableCallTransfer: ENABLE_CALL_TRANSFER,
-      transferPhoneNumberConfigured: Boolean(TRANSFER_PHONE_NUMBER),
-      doNotCall: sessionMemory.doNotCall,
-      isBusinessOwner: sessionMemory.isBusinessOwner,
-      isInterested: sessionMemory.isInterested,
-      happyToTransfer: sessionMemory.happyToTransfer,
-      customerName: sessionMemory.customerName,
-      businessName: sessionMemory.businessName,
-      businessType: sessionMemory.businessType,
-      hasUsefulBusinessContext: hasUsefulBusinessContext(sessionMemory),
-      timeInBusiness: sessionMemory.timeInBusiness,
-      hasCurrentWebsite: sessionMemory.hasCurrentWebsite,
-      hasCurrentSeoPackage: sessionMemory.hasCurrentSeoPackage,
-      currentSeoProvider: sessionMemory.currentSeoProvider,
-      mainGoal: sessionMemory.mainGoal,
-      coreDetailsReady: hasCoreTransferDetails(sessionMemory),
-      minimumDetailsReady: hasMinimumTransferDetails(sessionMemory),
-      leadComplete: isLeadComplete(sessionMemory),
-      customerSaidGoodbye: transcriptSuggestsGoodbye(cleanTranscript),
-    };
-
-    console.log("Transfer decision check:", debug);
-
-    if (!ENABLE_CALL_TRANSFER) {
-      console.log("Transfer decision: no, ENABLE_CALL_TRANSFER is false.");
-      return false;
-    }
-
-    if (!TRANSFER_PHONE_NUMBER) {
-      console.log("Transfer decision: no, TRANSFER_PHONE_NUMBER is missing.");
-      return false;
-    }
-
-    if (sessionMemory.doNotCall) {
-      console.log("Transfer decision: no, customer asked not to be called.");
-      return false;
-    }
-
-    if (sessionMemory.isBusinessOwner === "no") {
-      console.log("Transfer decision: no, customer does not have a business.");
-      return false;
-    }
-
-    if (sessionMemory.isInterested === "no") {
-      console.log("Transfer decision: no, customer is not interested.");
-      return false;
-    }
-
-    if (sessionMemory.happyToTransfer === false) {
-      console.log("Transfer decision: no, customer declined the transfer.");
-      return false;
-    }
-
-    if (transcriptSuggestsGoodbye(cleanTranscript)) {
-      console.log("Transfer decision: no, customer said goodbye.");
-      return false;
-    }
-
-    if (!hasMinimumTransferDetails(sessionMemory)) {
-      console.log("Transfer decision: no, qualification details are not complete yet.");
-      return false;
-    }
-
-    const aiReplyMentionsTransfer = replySuggestsTransfer(aiReply);
-
-    if (sessionMemory.happyToTransfer === true) {
-      console.log("Transfer decision: yes, lead is qualified and customer accepted transfer.");
-      return true;
-    }
-
-    if (aiReplyMentionsTransfer) {
-      console.log("Transfer decision: no, AI reply mentions transfer but customer transfer consent is not stored yet.");
-      return false;
-    }
-
-    console.log("Transfer decision: no, waiting for explicit transfer consent.");
     return false;
   }
 
@@ -1255,30 +1038,35 @@ wss.on("connection", (ws) => {
         return;
       }
 
+      // Never allow a live transfer. If the model tries to offer one and we
+      // don't yet have explicit callback consent, redirect to the consent
+      // question instead.
       if (
         qualificationReadyForConsent(sessionMemory) &&
-        sessionMemory.happyToTransfer !== true &&
-        replySuggestsTransfer(aiReply)
+        sessionMemory.happyForCallback !== true &&
+        aiReplySuggestsHandoff(aiReply)
       ) {
-        console.log("AI tried to transfer before stored consent, asking transfer consent instead.");
-        aiReply = transferConsentQuestion();
+        console.log(
+          "AI tried to offer a handoff. Replacing with callback consent question."
+        );
+
+        aiReply = callbackConsentQuestion();
       }
 
-      const shouldHangUp = shouldEndCallAfterReply({
-        cleanTranscript,
-        sessionMemory,
-        aiReply,
-      });
-
-      const shouldTransfer = shouldTransferCallAfterReply({
-        cleanTranscript,
-        sessionMemory,
-        aiReply,
-      });
-
-      if (shouldTransfer && TRANSFER_MESSAGE) {
-        aiReply = TRANSFER_MESSAGE;
+      // Once the customer has agreed to a callback, confirm it and end the
+      // call. This replaces the old live-transfer completion step.
+      if (sessionMemory.happyForCallback === true && !sessionMemory.callbackConfirmed) {
+        console.log("Customer agreed to a callback. Confirming and ending the call.");
+        aiReply = CALLBACK_CONFIRMATION_MESSAGE;
+        sessionMemory.callbackConfirmed = true;
       }
+
+      const shouldHangUp =
+        shouldEndCallAfterReply({
+          cleanTranscript,
+          sessionMemory,
+          aiReply,
+        }) || sessionMemory.callbackConfirmed === true;
 
       console.log("AI replied:", aiReply);
       addTranscriptLine("assistant", aiReply);
@@ -1312,18 +1100,11 @@ wss.on("connection", (ws) => {
       aiIsSpeaking = true;
       interruptionHappened = false;
 
-      if (shouldTransfer) {
-        pendingTransferAfterMark = markName;
-        schedulePendingTransferFallback(markName);
-        console.log("Call will transfer after AI finishes speaking:", {
-          markName,
-          fallbackDelayMs: TRANSFER_FALLBACK_DELAY_MS,
-        });
-      } else if (shouldHangUp) {
-          pendingHangupAfterMark = markName;
+      if (shouldHangUp) {
+        pendingHangupAfterMark = markName;
         console.log("Call will end after AI finishes speaking:", markName);
       } else {
-          markShouldStartSilenceTimer(markName);
+        markShouldStartSilenceTimer(markName);
       }
 
       sendAudioToTwilio(ws, currentStreamSid, aiAudio, markName);
@@ -1567,18 +1348,13 @@ wss.on("connection", (ws) => {
           clearPendingBargeInTimer();
         }
 
-        if (finishedMarkName && finishedMarkName === pendingTransferAfterMark) {
-          pendingTransferAfterMark = null;
-          clearPendingTransferFallbackTimer();
-          transferCallNow("Transfer message finished playing");
-          return;
-        }
-
         if (finishedMarkName && finishedMarkName === pendingHangupAfterMark) {
           pendingHangupAfterMark = null;
 
           if (voicemailHandled) {
             endCallNow("Voicemail message finished playing");
+          } else if (sessionMemory.callbackConfirmed) {
+            endCallNow("Callback arranged");
           } else {
             endCallNow("Final AI message finished playing");
           }
@@ -1602,10 +1378,8 @@ wss.on("connection", (ws) => {
       if (data.event === "stop") {
         clearIntroTimer();
         clearSilenceTimer();
-          clearPendingBargeInTimer();
+        clearPendingBargeInTimer();
         clearPendingVoicemailTimer();
-        clearPendingTransferFallbackTimer();
-        pendingTransferAfterMark = null;
         speechToText.close();
 
         console.log("Final session memory:", formatSessionMemoryForLog(sessionMemory));
@@ -1616,11 +1390,7 @@ wss.on("connection", (ws) => {
           totalAudioPackets: audioPacketCount,
         });
 
-        sendCallResultToRails(
-          transferInProgressReason
-            ? `Transferred call: ${transferInProgressReason}`
-            : "Twilio media stream stopped"
-        );
+        sendCallResultToRails(callEndReason || "Twilio media stream stopped");
       }
     } catch (error) {
       console.error("Error reading media stream message:", error.message);
@@ -1634,8 +1404,6 @@ wss.on("connection", (ws) => {
     clearSilenceTimer();
     clearPendingBargeInTimer();
     clearPendingVoicemailTimer();
-    clearPendingTransferFallbackTimer();
-    pendingTransferAfterMark = null;
     speechToText.close();
 
     console.log("Twilio media stream disconnected", {
@@ -1644,11 +1412,7 @@ wss.on("connection", (ws) => {
       totalAudioPackets: audioPacketCount,
     });
 
-    sendCallResultToRails(
-      transferInProgressReason
-        ? `Transferred call: ${transferInProgressReason}`
-        : "Twilio media stream disconnected"
-    );
+    sendCallResultToRails(callEndReason || "Twilio media stream disconnected");
   });
 
   ws.on("error", (error) => {
@@ -1656,17 +1420,11 @@ wss.on("connection", (ws) => {
     clearSilenceTimer();
     clearPendingBargeInTimer();
     clearPendingVoicemailTimer();
-    clearPendingTransferFallbackTimer();
-    pendingTransferAfterMark = null;
     speechToText.close();
 
     console.error("WebSocket error:", error.message);
     addTranscriptLine("system", `WebSocket error: ${error.message}`);
-    sendCallResultToRails(
-      transferInProgressReason
-        ? `Transferred call: ${transferInProgressReason}`
-        : "WebSocket error"
-    );
+    sendCallResultToRails(callEndReason || "WebSocket error");
   });
 });
 
