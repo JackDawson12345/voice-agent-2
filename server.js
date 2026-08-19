@@ -47,6 +47,12 @@ const INTRO_DELAY_MS = Number(process.env.INTRO_DELAY_MS || 2000);
 const SILENCE_TIMEOUT_MS = Number(process.env.SILENCE_TIMEOUT_MS || 8000);
 const MAX_SILENCE_CHECKS = Number(process.env.MAX_SILENCE_CHECKS || 1);
 
+// Safety net for final messages (do-not-call, voicemail, callback
+// confirmation). If Twilio's "mark" event for that audio never arrives -
+// which happens if the customer barges in and the buffer gets cleared -
+// this makes sure the call still ends instead of hanging open indefinitely.
+const HANGUP_FALLBACK_DELAY_MS = Number(process.env.HANGUP_FALLBACK_DELAY_MS || 6000);
+
 // Live transfer removed. Callback flow only.
 const CALLBACK_CONFIRMATION_MESSAGE =
   process.env.CALLBACK_CONFIRMATION_MESSAGE ||
@@ -306,6 +312,7 @@ wss.on("connection", (ws) => {
   let interruptionHappened = false;
 
   let pendingHangupAfterMark = null;
+  let pendingHangupFallbackTimer = null;
   let callEndReason = null;
   let callIsEnding = false;
 
@@ -401,6 +408,42 @@ wss.on("connection", (ws) => {
     }
 
     pendingBargeInTranscript = "";
+  }
+
+  function clearPendingHangupFallbackTimer() {
+    if (pendingHangupFallbackTimer) {
+      clearTimeout(pendingHangupFallbackTimer);
+      pendingHangupFallbackTimer = null;
+    }
+  }
+
+  // Registers the mark Twilio should report back once a final message has
+  // finished playing, so the call can be ended right after. If the customer
+  // barges in on that audio, Twilio clears its buffer and will never send
+  // that mark event back - so this also arms a fallback timer that ends the
+  // call anyway if the mark never arrives.
+  function scheduleHangupAfterMark(markName, reason) {
+    pendingHangupAfterMark = markName;
+    callEndReason = reason;
+
+    clearPendingHangupFallbackTimer();
+
+    pendingHangupFallbackTimer = setTimeout(() => {
+      pendingHangupFallbackTimer = null;
+
+      if (callIsEnding) {
+        return;
+      }
+
+      if (pendingHangupAfterMark !== markName) {
+        return;
+      }
+
+      console.log("Hangup fallback triggered because Twilio mark was not received:", markName);
+
+      pendingHangupAfterMark = null;
+      endCallNow(reason);
+    }, HANGUP_FALLBACK_DELAY_MS);
   }
 
   function cancelActiveAudioTracking() {
@@ -561,6 +604,7 @@ wss.on("connection", (ws) => {
       clearSilenceTimer();
       clearPendingBargeInTimer();
       clearPendingVoicemailTimer();
+      clearPendingHangupFallbackTimer();
 
       await endOutboundCall(currentCallSid);
 
@@ -801,7 +845,7 @@ wss.on("connection", (ws) => {
 
         activeAudioMark = markName;
         aiIsSpeaking = true;
-        pendingHangupAfterMark = markName;
+        scheduleHangupAfterMark(markName, "Voicemail message finished playing");
 
         console.log("Call will end after voicemail message:", markName);
 
@@ -962,7 +1006,7 @@ wss.on("connection", (ws) => {
 
       activeAudioMark = markName;
       aiIsSpeaking = true;
-      pendingHangupAfterMark = markName;
+      scheduleHangupAfterMark(markName, "Do-not-call message finished playing");
 
       console.log("Call will end after do-not-call message:", markName);
 
@@ -1101,7 +1145,11 @@ wss.on("connection", (ws) => {
       interruptionHappened = false;
 
       if (shouldHangUp) {
-        pendingHangupAfterMark = markName;
+        const hangupReason = sessionMemory.callbackConfirmed
+          ? "Callback arranged"
+          : "Final AI message finished playing";
+
+        scheduleHangupAfterMark(markName, hangupReason);
         console.log("Call will end after AI finishes speaking:", markName);
       } else {
         markShouldStartSilenceTimer(markName);
@@ -1253,6 +1301,15 @@ wss.on("connection", (ws) => {
           return;
         }
 
+        // Once a final message (do-not-call, voicemail, callback confirmation,
+        // goodbye) is playing or the call is already ending, ignore further
+        // speech entirely. Treating it as a barge-in would clear Twilio's
+        // audio buffer, which silently drops the "mark" event the hangup
+        // depends on - the fallback timer will end the call instead.
+        if (callIsEnding || pendingHangupAfterMark) {
+          return;
+        }
+
         // Any real transcript means the customer, voicemail, or screening assistant has spoken.
         // Stop silence timeout while we process it.
         clearSilenceTimer();
@@ -1350,14 +1407,9 @@ wss.on("connection", (ws) => {
 
         if (finishedMarkName && finishedMarkName === pendingHangupAfterMark) {
           pendingHangupAfterMark = null;
+          clearPendingHangupFallbackTimer();
 
-          if (voicemailHandled) {
-            endCallNow("Voicemail message finished playing");
-          } else if (sessionMemory.callbackConfirmed) {
-            endCallNow("Callback arranged");
-          } else {
-            endCallNow("Final AI message finished playing");
-          }
+          endCallNow(callEndReason || "Final AI message finished playing");
 
           return;
         }
@@ -1380,6 +1432,7 @@ wss.on("connection", (ws) => {
         clearSilenceTimer();
         clearPendingBargeInTimer();
         clearPendingVoicemailTimer();
+        clearPendingHangupFallbackTimer();
         speechToText.close();
 
         console.log("Final session memory:", formatSessionMemoryForLog(sessionMemory));
@@ -1404,6 +1457,7 @@ wss.on("connection", (ws) => {
     clearSilenceTimer();
     clearPendingBargeInTimer();
     clearPendingVoicemailTimer();
+    clearPendingHangupFallbackTimer();
     speechToText.close();
 
     console.log("Twilio media stream disconnected", {
@@ -1420,6 +1474,7 @@ wss.on("connection", (ws) => {
     clearSilenceTimer();
     clearPendingBargeInTimer();
     clearPendingVoicemailTimer();
+    clearPendingHangupFallbackTimer();
     speechToText.close();
 
     console.error("WebSocket error:", error.message);
