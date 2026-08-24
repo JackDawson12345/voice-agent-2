@@ -4,6 +4,8 @@ const WebSocket = require("ws");
 
 function createSpeechToTextStream({ onTranscript, onOpen, onClose, onError } = {}) {
   const apiKey = process.env.DEEPGRAM_API_KEY;
+  const endpointingMs = String(process.env.DEEPGRAM_ENDPOINTING_MS || "350");
+  const utteranceEndMs = String(process.env.DEEPGRAM_UTTERANCE_END_MS || "1000");
 
   if (!apiKey) {
     throw new Error("DEEPGRAM_API_KEY is missing from .env");
@@ -17,8 +19,8 @@ function createSpeechToTextStream({ onTranscript, onOpen, onClose, onError } = {
     language: "en-GB",
     interim_results: "true",
     punctuate: "true",
-    endpointing: "200",
-    utterance_end_ms: "1000",
+    endpointing: endpointingMs,
+    utterance_end_ms: utteranceEndMs,
   });
 
   const deepgramUrl = `wss://api.deepgram.com/v1/listen?${params.toString()}`;

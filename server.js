@@ -38,14 +38,16 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
 const INTRO_MESSAGE =
-  "Hello, this is Lily from Unitel Direct. I was just calling briefly about your business, website and online enquiries. Is now an okay time?";
+  process.env.INTRO_MESSAGE ||
+  "Hi, it's Lily from Unitel Direct. We help local businesses get more enquiries online. Have I caught you at an okay time?";
 
 const SILENCE_CHECK_MESSAGE =
   process.env.SILENCE_CHECK_MESSAGE || "Hello, are you still there?";
 
-const INTRO_DELAY_MS = Number(process.env.INTRO_DELAY_MS || 2000);
+const INTRO_DELAY_MS = Number(process.env.INTRO_DELAY_MS || 700);
 const SILENCE_TIMEOUT_MS = Number(process.env.SILENCE_TIMEOUT_MS || 8000);
 const MAX_SILENCE_CHECKS = Number(process.env.MAX_SILENCE_CHECKS || 1);
+const BARGE_IN_DEBOUNCE_MS = Number(process.env.BARGE_IN_DEBOUNCE_MS || 250);
 
 // Safety net for final messages (do-not-call, voicemail, callback
 // confirmation). If Twilio's "mark" event for that audio never arrives -
@@ -58,6 +60,9 @@ const CALLBACK_CONFIRMATION_MESSAGE =
   process.env.CALLBACK_CONFIRMATION_MESSAGE ||
   "Perfect, I’ll pass your details over and someone from the team will give you a call back.";
 const ENABLE_CALLBACK_FLOW = true;
+const NATURAL_CALLBACK_CONFIRMATION_MESSAGE =
+  process.env.CALLBACK_CONFIRMATION_MESSAGE ||
+  "No problem, I'll pass that over and someone from the team will give you a call back.";
 
 function xmlEscape(value) {
   return String(value || "")
@@ -288,6 +293,7 @@ wss.on("connection", (ws) => {
 
   let aiIsThinking = false;
   let lastFinalTranscript = "";
+  let lastFinalTranscriptAt = 0;
 
   let customerHasSpoken = false;
   let introHasPlayed = false;
@@ -320,6 +326,7 @@ wss.on("connection", (ws) => {
   // This prevents tiny bits of background noise from cutting the AI off.
   let pendingBargeInTimer = null;
   let pendingBargeInTranscript = "";
+  const pendingCustomerSegments = [];
 
   function addTranscriptLine(role, content) {
     if (!content) {
@@ -331,6 +338,83 @@ wss.on("connection", (ws) => {
       content,
       at: new Date().toISOString(),
     });
+  }
+
+  function normaliseTranscriptText(value) {
+    return String(value || "").replace(/\s+/g, " ").trim();
+  }
+
+  function resetPendingCustomerUtterance() {
+    pendingCustomerSegments.length = 0;
+  }
+
+  function storePendingCustomerSegment(transcript, raw) {
+    const cleanTranscript = normaliseTranscriptText(transcript);
+
+    if (!cleanTranscript) {
+      return;
+    }
+
+    const start = Number(raw?.start);
+    const duration = Number(raw?.duration);
+    const segmentKey = Number.isFinite(start)
+      ? start.toFixed(3)
+      : `segment-${pendingCustomerSegments.length}`;
+    const segment = {
+      key: segmentKey,
+      start: Number.isFinite(start) ? start : pendingCustomerSegments.length,
+      end:
+        Number.isFinite(start) && Number.isFinite(duration)
+          ? start + duration
+          : null,
+      transcript: cleanTranscript,
+    };
+
+    const existingIndex = pendingCustomerSegments.findIndex(
+      (entry) => entry.key === segmentKey
+    );
+
+    if (existingIndex >= 0) {
+      pendingCustomerSegments[existingIndex] = segment;
+      return;
+    }
+
+    pendingCustomerSegments.push(segment);
+  }
+
+  function takePendingCustomerUtterance(fallbackTranscript = "") {
+    const joinedTranscript = pendingCustomerSegments
+      .slice()
+      .sort((left, right) => left.start - right.start)
+      .map((segment) => segment.transcript)
+      .filter(Boolean)
+      .join(" ");
+
+    const combinedTranscript = normaliseTranscriptText(joinedTranscript);
+    const fallback = normaliseTranscriptText(fallbackTranscript);
+
+    resetPendingCustomerUtterance();
+
+    if (!combinedTranscript) {
+      return fallback;
+    }
+
+    if (!fallback) {
+      return combinedTranscript;
+    }
+
+    const combinedLower = combinedTranscript.toLowerCase();
+    const fallbackLower = fallback.toLowerCase();
+
+    if (
+      combinedLower === fallbackLower ||
+      combinedLower.includes(fallbackLower) ||
+      combinedLower.endsWith(` ${fallbackLower}`)
+    ) {
+      return combinedTranscript;
+    }
+
+    return normaliseTranscriptText(`${combinedTranscript} ${fallback}`);
   }
 
   async function sendCallResultToRails(reason) {
@@ -707,6 +791,7 @@ wss.on("connection", (ws) => {
     callScreeningReplySent = true;
     customerHasSpoken = true;
     silenceCheckCount = 0;
+    resetPendingCustomerUtterance();
 
     clearIntroTimer();
     clearSilenceTimer();
@@ -794,6 +879,7 @@ wss.on("connection", (ws) => {
 
     voicemailHandled = true;
     customerHasSpoken = true;
+    resetPendingCustomerUtterance();
 
     clearIntroTimer();
     clearSilenceTimer();
@@ -927,7 +1013,7 @@ wss.on("connection", (ws) => {
   }
 
   function callbackConsentQuestion() {
-    return "Perfect, I have enough details. Would you like me to arrange for someone from the team to give you a call back?";
+    return "That gives me a good picture. Would you like someone from the team to give you a quick call back?";
   }
 
   function hasCoreCallbackDetails(memory) {
@@ -950,6 +1036,27 @@ wss.on("connection", (ws) => {
         memory.isInterested === "yes" &&
         memory.happyForCallback === true
     );
+  }
+
+  function getFastPathReply(memory) {
+    if (memory.happyForCallback === true && !memory.callbackConfirmed) {
+      memory.callbackConfirmed = true;
+      return NATURAL_CALLBACK_CONFIRMATION_MESSAGE;
+    }
+
+    if (memory.isBusinessOwner === "no") {
+      return "No worries, thanks for your time. Goodbye.";
+    }
+
+    if (memory.isInterested === "no" && memory.happyForCallback !== true) {
+      return "No problem, thanks for your time. Goodbye.";
+    }
+
+    if (qualificationReadyForConsent(memory) && memory.happyForCallback !== true) {
+      return callbackConsentQuestion();
+    }
+
+    return null;
   }
 
   function shouldEndCallAfterReply({ cleanTranscript, sessionMemory }) {
@@ -1053,11 +1160,17 @@ wss.on("connection", (ws) => {
 
       console.log("AI response started");
 
-      let aiReply = await getAIResponse({
-        transcript: cleanTranscript,
-        conversationHistory,
-        sessionMemory,
-      });
+      let aiReply = getFastPathReply(sessionMemory);
+
+      if (aiReply) {
+        console.log("Using fast-path reply");
+      } else {
+        aiReply = await getAIResponse({
+          transcript: cleanTranscript,
+          conversationHistory,
+          sessionMemory,
+        });
+      }
 
       const aiFinishedAt = Date.now();
 
@@ -1101,7 +1214,7 @@ wss.on("connection", (ws) => {
       // call. This replaces the old live-transfer completion step.
       if (sessionMemory.happyForCallback === true && !sessionMemory.callbackConfirmed) {
         console.log("Customer agreed to a callback. Confirming and ending the call.");
-        aiReply = CALLBACK_CONFIRMATION_MESSAGE;
+        aiReply = NATURAL_CALLBACK_CONFIRMATION_MESSAGE;
         sessionMemory.callbackConfirmed = true;
       }
 
@@ -1285,19 +1398,21 @@ wss.on("connection", (ws) => {
 
       clearSilenceTimer();
       clearPendingBargeInTimer();
-    }, 250);
+    }, BARGE_IN_DEBOUNCE_MS);
   }
 
   const speechToText = createSpeechToTextStream({
-    onTranscript: async ({ transcript, isFinal, speechFinal, utteranceEnd }) => {
+    onTranscript: async ({
+      transcript,
+      isFinal,
+      speechFinal,
+      utteranceEnd,
+      raw,
+    }) => {
       try {
-        if (utteranceEnd) {
-          return;
-        }
+        const cleanTranscript = normaliseTranscriptText(transcript);
 
-        const cleanTranscript = transcript.trim();
-
-        if (!cleanTranscript) {
+        if (!cleanTranscript && !utteranceEnd) {
           return;
         }
 
@@ -1318,7 +1433,7 @@ wss.on("connection", (ws) => {
         // This must not be treated as voicemail.
         if (isIphoneCallScreeningPrompt(cleanTranscript)) {
           silenceCheckCount = 0;
-              await answerIphoneCallScreeningPrompt();
+          await answerIphoneCallScreeningPrompt();
           return;
         }
 
@@ -1326,7 +1441,7 @@ wss.on("connection", (ws) => {
         // This leaves one message, then hangs up.
         if (isVoicemailOrAnswerMachine(cleanTranscript)) {
           silenceCheckCount = 0;
-              await leaveVoicemailAndHangUp(cleanTranscript);
+          await leaveVoicemailAndHangUp(cleanTranscript);
           return;
         }
 
@@ -1340,21 +1455,39 @@ wss.on("connection", (ws) => {
           scheduleBargeIn(cleanTranscript);
         }
 
-        customerHasSpoken = true;
-        clearIntroTimer();
+        if (cleanTranscript) {
+          customerHasSpoken = true;
+          clearIntroTimer();
+        }
 
-        if (!isFinal && !speechFinal) {
+        if (isFinal && cleanTranscript) {
+          storePendingCustomerSegment(cleanTranscript, raw);
+        }
+
+        if (!speechFinal && !utteranceEnd) {
           return;
         }
 
-        if (cleanTranscript === lastFinalTranscript) {
+        const finalTranscript = takePendingCustomerUtterance(cleanTranscript);
+
+        if (!finalTranscript) {
           return;
         }
 
-        lastFinalTranscript = cleanTranscript;
+        const processedAt = Date.now();
+
+        if (
+          finalTranscript === lastFinalTranscript &&
+          processedAt - lastFinalTranscriptAt < 1500
+        ) {
+          return;
+        }
+
+        lastFinalTranscript = finalTranscript;
+        lastFinalTranscriptAt = processedAt;
         silenceCheckCount = 0;
 
-        await processFinalCustomerTranscript(cleanTranscript);
+        await processFinalCustomerTranscript(finalTranscript);
       } catch (error) {
         aiIsThinking = false;
         console.error("Transcript handling error:", error.message);
