@@ -65,14 +65,14 @@ function hasAny(text, phrases) {
 }
 
 function isSimpleYes(text) {
-  return /^(yes|yeah|yep|yeh|sure|okay|ok|correct|that'?s right|it is|it does|i am|we are)\b/i.test(
-    text
+  return /^(?:yes|yeah|yep|yeh|sure|okay|ok|correct|that'?s right|fine|go ahead|please do|happy to)[.!?\s]*$/i.test(
+    cleanValue(text)
   );
 }
 
 function isSimpleNo(text) {
-  return /^(no|nope|nah|not really|not at the moment|not now|i'?m not|we'?re not)\b/i.test(
-    text
+  return /^(?:no|nope|nah|not really|not at the moment|not now|rather not)[.!?\s]*$/i.test(
+    cleanValue(text)
   );
 }
 
@@ -125,11 +125,29 @@ function extractAfterPatterns(text, patterns) {
 }
 
 function extractUkPostcode(text) {
-  const match = String(text || "").match(
+  const rawText = String(text || "");
+  const match = rawText.match(
     /\b([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})\b/i
   );
 
-  return match ? cleanValue(match[1]).toUpperCase() : null;
+  if (match) {
+    return cleanValue(match[1]).toUpperCase();
+  }
+
+  const tokens = stripLeadingPhrase(rawText, [
+    /^(?:it is|it's|the postcode is)[,.\s-]+/i,
+  ])
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .map(normaliseSingleWordToken)
+    .filter(Boolean);
+
+  if (tokens.length < 5 || tokens.length > 7) {
+    return null;
+  }
+
+  return formatUkPostcode(tokens.join(""));
 }
 
 function extractWebsiteAddress(text) {
@@ -138,6 +156,16 @@ function extractWebsiteAddress(text) {
   );
 
   return match ? cleanValue(match[1]) : null;
+}
+
+function stripLeadingPhrase(text, patterns) {
+  let value = cleanValue(text);
+
+  for (const pattern of patterns) {
+    value = value.replace(pattern, "");
+  }
+
+  return cleanValue(value);
 }
 
 function extractPersonName(text) {
@@ -156,6 +184,69 @@ function extractBusinessName(text) {
       /(?:the business is|the company is)\s+(.{2,100})$/i,
     ]) || null
   );
+}
+
+function normaliseBusinessNameAnswer(text) {
+  return stripLeadingPhrase(text, [
+    /^(?:yes|yeah|yep|yeh|okay|ok|right|correct)[,.\s-]+/i,
+    /^(?:it is|it's|this is)[,.\s-]+/i,
+  ]);
+}
+
+function normaliseBusinessAddressAnswer(text) {
+  return stripLeadingPhrase(text, [
+    /^(?:it is|it's|this is)[,.\s-]+/i,
+    /^(?:the address is|our address is|we are at|we're at)[,.\s-]+/i,
+  ]);
+}
+
+function normaliseIndustryAnswer(text) {
+  return stripLeadingPhrase(text, [
+    /^(?:it is|it's|we are|we're)[,.\s-]+/i,
+    /^(?:a|an)\s+/i,
+  ]);
+}
+
+function normaliseSingleWordToken(token) {
+  const lowered = String(token || "").toLowerCase();
+  const digitWords = {
+    zero: "0",
+    oh: "0",
+    o: "0",
+    one: "1",
+    two: "2",
+    three: "3",
+    four: "4",
+    five: "5",
+    six: "6",
+    seven: "7",
+    eight: "8",
+    nine: "9",
+  };
+
+  if (digitWords[lowered]) {
+    return digitWords[lowered];
+  }
+
+  if (/^[a-z]$/i.test(lowered)) {
+    return lowered.toUpperCase();
+  }
+
+  if (/^\d$/.test(lowered)) {
+    return lowered;
+  }
+
+  return null;
+}
+
+function formatUkPostcode(compactPostcode) {
+  const value = String(compactPostcode || "").replace(/\s+/g, "").toUpperCase();
+
+  if (!/^[A-Z]{1,2}\d[A-Z\d]?\d[A-Z]{2}$/.test(value)) {
+    return null;
+  }
+
+  return `${value.slice(0, -3)} ${value.slice(-3)}`;
 }
 
 function extractRole(text) {
@@ -235,6 +326,27 @@ function inferIndustryFromText(text) {
   }
 
   return null;
+}
+
+function looksLikeOnlineEnquiryAnswer(text) {
+  const lower = compactText(text);
+
+  return (
+    hasAny(lower, [
+      "online",
+      "search",
+      "website",
+      "google",
+      "enquiries",
+      "inquiries",
+      "facebook",
+      "instagram",
+      "leads",
+      "messages",
+      "contact form",
+    ]) ||
+    /\b(yes|no|some|none)\b/i.test(lower)
+  );
 }
 
 function setField(memory, field, value, changedFields) {
@@ -456,7 +568,9 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
 
   const businessName =
     extractBusinessName(rawText) ||
-    (assistantAskedBusinessName && shouldStoreRawAnswer(rawText) ? rawText : null);
+    (assistantAskedBusinessName && shouldStoreRawAnswer(rawText)
+      ? normaliseBusinessNameAnswer(rawText)
+      : null);
 
   if (businessName && !memory.wrongNumber) {
     setField(memory, "businessName", businessName, changedFields);
@@ -474,7 +588,12 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     shouldStoreRawAnswer(rawText) &&
     !memory.wrongNumber
   ) {
-    setField(memory, "businessAddress", rawText, changedFields);
+    setField(
+      memory,
+      "businessAddress",
+      normaliseBusinessAddressAnswer(rawText),
+      changedFields
+    );
     setField(memory, "correctBusinessConfirmed", "yes", changedFields);
   }
 
@@ -590,8 +709,10 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
       setField(memory, "onlineEnquiryStatus", "yes", changedFields);
     } else if (isNegativeAnswer(rawText)) {
       setField(memory, "onlineEnquiryStatus", "no", changedFields);
-    } else if (shouldStoreRawAnswer(rawText)) {
+    } else if (shouldStoreRawAnswer(rawText) && looksLikeOnlineEnquiryAnswer(rawText)) {
       setField(memory, "onlineEnquiryStatus", rawText, changedFields);
+    } else if (shouldStoreRawAnswer(rawText)) {
+      pushNote(memory, `Unclear online enquiry answer: ${rawText}`, changedFields);
     }
   }
 
@@ -610,7 +731,7 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     inferIndustryFromText(rawText) || inferIndustryFromText(memory.businessName);
 
   if (assistantAskedIndustry && shouldStoreRawAnswer(rawText)) {
-    setField(memory, "industry", rawText, changedFields);
+    setField(memory, "industry", normaliseIndustryAnswer(rawText), changedFields);
   } else if (!memory.industry && inferredIndustry) {
     setField(memory, "industry", inferredIndustry, changedFields);
   }

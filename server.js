@@ -76,6 +76,10 @@ function xmlEscape(value) {
     .replace(/>/g, "&gt;");
 }
 
+function normaliseCallbackUrl(url) {
+  return String(url || "").replace(/([^:]\/)\/+/g, "$1");
+}
+
 // Stores Rails/Ruby context against the Twilio callSid.
 // This lets the WebSocket part know which Rails phone_number record to update
 // when Twilio later connects the media stream.
@@ -152,8 +156,9 @@ app.post("/start-call", async (req, res) => {
     }
 
     const resolvedPhoneNumberId = phone_number_id || phoneNumberId || null;
-    const resolvedCallbackUrl =
-      callback_url || callbackUrl || DEFAULT_RAILS_CALLBACK_URL;
+    const resolvedCallbackUrl = normaliseCallbackUrl(
+      callback_url || callbackUrl || DEFAULT_RAILS_CALLBACK_URL
+    );
 
     const call = await startOutboundCall(to);
 
@@ -454,8 +459,15 @@ wss.on("connection", (ws) => {
   function buildCallbackConfirmationMessage(memory) {
     const date = memory.callbackDate || "the agreed day";
     const time = memory.callbackTime || "the agreed time";
+    const lowerTime = String(time).toLowerCase();
+    const timePhrase =
+      lowerTime === "morning" || lowerTime === "afternoon" || lowerTime === "evening"
+        ? `${date} in the ${lowerTime}`
+        : lowerTime === "lunchtime"
+          ? `${date} at lunchtime`
+          : `${date} at ${time}`;
 
-    return `Perfect, I have arranged a callback for ${date} at ${time}. Thank you for your time and we will speak with you then.`;
+    return `Perfect, I have arranged a callback for ${timePhrase}. Thank you for your time and we will speak with you then.`;
   }
 
   function determineCallOutcome(reason) {
