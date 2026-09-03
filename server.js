@@ -1100,6 +1100,82 @@ wss.on("connection", (ws) => {
     return lower.includes("for our records");
   }
 
+  function looksLikeCustomerQuestion(text) {
+    const lower = String(text || "").toLowerCase().trim();
+
+    if (!lower) {
+      return false;
+    }
+
+    if (lower.includes("?")) {
+      return true;
+    }
+
+    return /^(who|what|when|where|why|how|is this|are you|can you|could you|would you|do you|did you)\b/.test(
+      lower
+    );
+  }
+
+  function getScriptedNextQuestion(memory) {
+    if (!memory.contactName) {
+      return "Sorry, could I ask who I am speaking with please?";
+    }
+
+    if (!memory.businessName) {
+      return "I just wanted to confirm I have reached the right business. Could you tell me the name of your business please?";
+    }
+
+    if (!memory.businessAddress) {
+      return "Could I also confirm the best address for the business?";
+    }
+
+    if (!memory.postcode) {
+      return "And could I confirm the postcode please?";
+    }
+
+    if (!memory.isDecisionMaker) {
+      return "Are you the business owner, or are you the person who looks after decisions around advertising, websites or online marketing?";
+    }
+
+    if (memory.isDecisionMaker === "yes" && !memory.websiteStatus) {
+      return "Do you currently have a website for your business?";
+    }
+
+    if (memory.isDecisionMaker === "yes" && memory.websiteStatus === "yes" && !memory.websiteAge) {
+      return "How long have you had your website?";
+    }
+
+    if (
+      memory.isDecisionMaker === "yes" &&
+      memory.websiteStatus === "no" &&
+      !memory.websiteInterestLevel
+    ) {
+      return "Have you ever considered getting a website to help customers find your business online?";
+    }
+
+    if (memory.isDecisionMaker === "yes" && !memory.onlineEnquiryStatus) {
+      return "Do you currently receive enquiries from customers through online searches or your website?";
+    }
+
+    if (memory.isDecisionMaker === "yes" && !memory.interestInMoreEnquiries) {
+      return "Would you be interested in receiving more enquiries from customers searching online?";
+    }
+
+    if (memory.isDecisionMaker === "yes" && !memory.industry) {
+      return "What type of business or industry are you in?";
+    }
+
+    if (memory.isDecisionMaker === "yes" && !memory.callbackDate) {
+      return callbackConsentQuestion();
+    }
+
+    if (memory.isDecisionMaker === "yes" && !memory.callbackTime) {
+      return "What time would suit you best?";
+    }
+
+    return null;
+  }
+
   function getFastPathReply(memory, cleanTranscript) {
     const lowerTranscript = String(cleanTranscript || "").toLowerCase();
     const declinedRecords =
@@ -1188,6 +1264,12 @@ wss.on("connection", (ws) => {
         memory.callbackConfirmed = true;
         return buildCallbackConfirmationMessage(memory);
       }
+    }
+
+    const scriptedNextQuestion = getScriptedNextQuestion(memory);
+
+    if (scriptedNextQuestion && !looksLikeCustomerQuestion(cleanTranscript)) {
+      return scriptedNextQuestion;
     }
 
     return null;

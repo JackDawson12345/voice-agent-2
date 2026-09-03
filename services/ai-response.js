@@ -8,86 +8,158 @@ const openai = new OpenAI({
 });
 
 const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const AGENT_NAME = process.env.AGENT_NAME || "Lily";
+const CLIENT_COMPANY_NAME = process.env.CLIENT_COMPANY_NAME || "118 Online";
 
-const SYSTEM_PROMPT = `You are Lily, a human-sounding outbound caller for Unitel Direct.
+const SYSTEM_PROMPT = `You are ${AGENT_NAME}, a professional B2B appointment booking assistant calling businesses on behalf of ${CLIENT_COMPANY_NAME}.
 
-You are calling business customers to see whether they may be interested in a website and SEO package.
+Your only purpose is to:
+1. Confirm you have reached the correct business.
+2. Identify the business owner or person responsible for advertising, website or online marketing decisions.
+3. Collect basic business information.
+4. Arrange a suitable callback time with a UK specialist.
 
-Your goal is to qualify the customer and, only if they are interested, arrange for a member of the Unitel Direct team to call them back.
+You do not sell services on this call. Your goal is only to arrange a callback.
 
-Collect:
-
-Customer name.
-Whether they run, own, or manage a business.
-Business name.
-Business type.
-How long they have been in business.
-Whether they currently have a website.
-If they have a website, the website address if they know it.
-Whether they currently have SEO, Google marketing, social media marketing, Facebook, or another online marketing package.
-What they would most like to improve online.
-Whether they would like a member of the Unitel Direct team to contact them.
-
-Qualification order:
-
-1. Whether they run, own, or manage a business.
-2. Customer name.
-3. Business name.
-4. Business type.
-5. How long they have been in business.
-6. Whether they currently have a website.
-7. Website address if they have one.
-8. Whether they currently use SEO or online marketing.
-9. What they would most like to improve online.
-10. Whether they would like a callback from the team.
-
-If the business name clearly includes the trade, treat the business type as known.
-
-Package details:
-
-Unitel Direct provides landing page websites designed to generate enquiries.
-The websites are supported by SEO focused on search engine rankings.
-The aim is to help local businesses get found online and generate enquiries.
-
-Speaking style:
-
-Use British English.
-Sound like a real person on a phone call, not a polished script.
-Use short everyday wording and contractions.
-Keep most replies to one short sentence.
-Ask one question at a time.
-Briefly acknowledge what the customer just said when it helps.
-Vary your phrasing so you do not sound repetitive.
-Be warm, calm, and professional.
-Do not be pushy.
-Do not sound overly cheerful or salesy.
-Avoid stock phrases like "Perfect" unless they genuinely fit.
+Tone:
+- Friendly, professional and conversational.
+- Use UK English.
+- Keep the conversation natural.
+- Do not sound like a scripted robot.
+- Be respectful of the person's time.
+- Do not pressure the customer.
 
 Call flow:
-
-Start with a brief introduction as Lily from Unitel Direct.
-Explain you are calling about helping local businesses get more enquiries online.
-First ask whether they run, own, or manage a business.
-
-After qualification, explain the package in one or two plain sentences and ask whether they would like a callback.
-
-Do not ask for callback numbers or callback times because the customer's phone number is already available.
-
-If the customer directly asks for a callback, do not ask again. Confirm the callback immediately.
-
-If they are not interested:
-Thank them politely and end the call.
-
-If they ask not to be called again:
-Apologise, confirm you will make a note, and end the call.
-
-Do not:
-Ask multiple questions at once.
-Repeat known facts.
-Give long explanations.
-Use pushy sales language.
-Continue selling after a clear no.
+- Start from this opening: "Hi, my name is ${AGENT_NAME} calling on behalf of ${CLIENT_COMPANY_NAME}. I am just calling regarding your business and online visibility. Could I ask who I am speaking with please?"
+- Then follow the callback-booking script and collect the missing details in order.
+- Ask one question at a time.
+- Stay close to the script wording, but sound natural.
+- Do not repeat facts already known.
+- Do not switch into a sales pitch.
+- Never mention Unitel Direct, SEO packages, landing pages, or live transfers.
+- If the customer asks what the call is about, briefly say you are calling on behalf of ${CLIENT_COMPANY_NAME} regarding their business and online visibility, then return to the next step.
+- If they are busy, ask when would be a better time for a callback.
+- If they are not interested, politely confirm the contact name and business name for your records, then end the call.
+- If they say it is the wrong number or wrong business, apologise briefly and end the call.
+- If they ask not to be called again, apologise, confirm you will note it, and end the call.
+- Once a callback day and time are known, give a short confirmation and stop asking questions.
 `.trim();
+
+function hasWebsiteBranchDetail(sessionMemory = {}) {
+  if (sessionMemory.websiteStatus === "yes") {
+    return Boolean(sessionMemory.websiteAge);
+  }
+
+  if (sessionMemory.websiteStatus === "no") {
+    return Boolean(sessionMemory.websiteInterestLevel);
+  }
+
+  return false;
+}
+
+function getNextStepInstruction(sessionMemory = {}) {
+  if (sessionMemory.doNotCall) {
+    return "They do not want any more calls. Apologise briefly, confirm you will make a note, and end the call.";
+  }
+
+  if (sessionMemory.wrongNumber || sessionMemory.correctBusinessConfirmed === "no") {
+    return "They have said this is the wrong number or wrong business. Acknowledge that and end the call politely.";
+  }
+
+  if (sessionMemory.busy && !sessionMemory.callbackDate) {
+    return "They are busy. Ask what day would be better for a callback.";
+  }
+
+  if (sessionMemory.busy && !sessionMemory.callbackTime) {
+    return "They are busy. Ask what time would be better for the callback.";
+  }
+
+  if (sessionMemory.notInterested || sessionMemory.interestInMoreEnquiries === "no") {
+    if (!sessionMemory.contactName) {
+      return "They are not interested. Before ending the call, ask to confirm the contact name for your records.";
+    }
+
+    if (!sessionMemory.businessName) {
+      return "They are not interested. Before ending the call, ask to confirm the business name for your records.";
+    }
+
+    return "They are not interested and you have the minimum record details. Thank them politely and end the call.";
+  }
+
+  if (!sessionMemory.contactName) {
+    return "Ask who you are speaking with.";
+  }
+
+  if (!sessionMemory.businessName) {
+    return "Confirm you have reached the correct business and ask for the business name.";
+  }
+
+  if (!sessionMemory.businessAddress) {
+    return "Ask for the best address for the business.";
+  }
+
+  if (!sessionMemory.postcode) {
+    return "Ask for the postcode.";
+  }
+
+  if (!sessionMemory.isDecisionMaker) {
+    return "Ask whether they are the business owner or the person who handles decisions around advertising, websites or online marketing.";
+  }
+
+  if (sessionMemory.isDecisionMaker === "no") {
+    if (!sessionMemory.decisionMakerName) {
+      return "Ask who would normally handle those decisions.";
+    }
+
+    if (!sessionMemory.decisionMakerRole) {
+      return "Ask what that person's role is.";
+    }
+
+    if (!sessionMemory.callbackDate) {
+      return "Ask what day would be best for one of your UK specialists to reach them.";
+    }
+
+    if (!sessionMemory.callbackTime) {
+      return "Ask what time would suit them best.";
+    }
+
+    return "A callback slot is arranged for the decision maker. Give a short confirmation and stop.";
+  }
+
+  if (!sessionMemory.websiteStatus) {
+    return "Ask whether they currently have a website for the business.";
+  }
+
+  if (!hasWebsiteBranchDetail(sessionMemory)) {
+    if (sessionMemory.websiteStatus === "yes") {
+      return "Ask how long they have had their website.";
+    }
+
+    return "Ask whether they have ever considered getting a website to help customers find the business online.";
+  }
+
+  if (!sessionMemory.onlineEnquiryStatus) {
+    return "Ask whether they currently receive enquiries through online searches or the website.";
+  }
+
+  if (!sessionMemory.interestInMoreEnquiries) {
+    return "Ask whether they would be interested in receiving more enquiries from customers searching online.";
+  }
+
+  if (!sessionMemory.industry) {
+    return "Ask what type of business or industry they are in.";
+  }
+
+  if (!sessionMemory.callbackDate) {
+    return "Explain briefly that a UK specialist can have a quick chat, then ask what day would suit them best for a callback.";
+  }
+
+  if (!sessionMemory.callbackTime) {
+    return "Ask what time would suit them best for the callback.";
+  }
+
+  return "A callback day and time are known. Give a short confirmation and stop.";
+}
 
 async function getAIResponse({ transcript, conversationHistory = [], sessionMemory }) {
   if (!process.env.OPENAI_API_KEY) {
@@ -101,6 +173,7 @@ async function getAIResponse({ transcript, conversationHistory = [], sessionMemo
   const memorySummary = sessionMemory
     ? formatSessionMemoryForPrompt(sessionMemory)
     : "No session memory available.";
+  const nextStepInstruction = getNextStepInstruction(sessionMemory);
 
   const input = [
     {
@@ -115,11 +188,12 @@ ${memorySummary}
 
 Important:
 Do not ask for known facts again.
-Ask the next missing detail in the qualification order.
-If the customer wants a callback, confirm that someone from Unitel Direct will contact them.
+Ask the next missing detail in the script.
+Ask only one question unless you are giving a short closing confirmation.
 Do not ask for a callback number or callback time.
-Do not suggest a callback until the qualification details are collected.
-If the customer has agreed to a callback, give a short confirmation.
+If a callback day and time are already known, give a short confirmation.
+Next step:
+${nextStepInstruction}
 Keep the reply conversational and brief enough to say naturally on a phone call.
 `.trim(),
     },

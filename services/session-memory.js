@@ -143,7 +143,7 @@ function extractWebsiteAddress(text) {
 function extractPersonName(text) {
   return (
     extractAfterPatterns(text, [
-      /(?:my name is|this is|i am|i'm|it'?s)\s+([a-z][a-z .'-]{1,60})$/i,
+      /(?:my name is|this is|i am|i'm)\s+([a-z][a-z .'-]{1,60})$/i,
       /(?:hello|hi|hiya)?[\s,.]*([a-z][a-z .'-]{1,60})\s+(?:speaking|here)$/i,
     ]) || null
   );
@@ -448,7 +448,7 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   const contactName =
     extractPersonName(speechText) || extractPersonName(rawText) || null;
 
-  if (contactName) {
+  if (contactName && (!memory.contactName || assistantAskedContactName)) {
     setField(memory, "contactName", contactName, changedFields);
   } else if (assistantAskedContactName && shouldStoreRawAnswer(rawText)) {
     setField(memory, "contactName", rawText, changedFields);
