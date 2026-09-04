@@ -63,8 +63,17 @@ const INTRO_MESSAGE =
     companyName: SPOKEN_CLIENT_COMPANY_NAME,
   });
 
+const DEFAULT_SILENCE_CHECK_MESSAGE = "Hello, are you still on the line?";
+const LEGACY_SILENCE_CHECK_MESSAGE = "Hello, are you still there?";
+const CONFIGURED_SILENCE_CHECK_MESSAGE = String(
+  process.env.SILENCE_CHECK_MESSAGE || ""
+).trim();
 const SILENCE_CHECK_MESSAGE =
-  process.env.SILENCE_CHECK_MESSAGE || "Hello, are you still on the line?";
+  !CONFIGURED_SILENCE_CHECK_MESSAGE ||
+  CONFIGURED_SILENCE_CHECK_MESSAGE.toLowerCase() ===
+    LEGACY_SILENCE_CHECK_MESSAGE.toLowerCase()
+    ? DEFAULT_SILENCE_CHECK_MESSAGE
+    : CONFIGURED_SILENCE_CHECK_MESSAGE;
 
 const INTRO_DELAY_MS = Number(process.env.INTRO_DELAY_MS || 700);
 const SILENCE_TIMEOUT_MS = Number(process.env.SILENCE_TIMEOUT_MS || 8000);
@@ -1291,6 +1300,12 @@ wss.on("connection", (ws) => {
     );
   }
 
+  function isSimpleGreeting(text) {
+    return /^(?:hi|hello|hey|hiya|good morning|good afternoon|good evening)[.!?\s]*$/i.test(
+      String(text || "").trim()
+    );
+  }
+
   function hasPriorCustomerTurn() {
     return conversationHistory.some(
       (message) => message && message.role === "user" && message.content
@@ -1344,6 +1359,16 @@ wss.on("connection", (ws) => {
     return `${greetingPrefix} As I was saying, I am calling on behalf of ${SPOKEN_CLIENT_COMPANY_NAME} regarding online visibility for businesses. Are you the business owner?`;
   }
 
+  function buildOwnerStatusFollowUpReply(memory) {
+    const contactName = String(memory?.contactName || "").trim();
+
+    if (contactName) {
+      return `Hi ${contactName}. Are you the business owner?`;
+    }
+
+    return "Hi there. Are you the business owner?";
+  }
+
   function getFastPathReply(memory, cleanTranscript) {
     if (memory.wrongNumber || memory.correctBusinessConfirmed === "no") {
       return "Thanks for letting me know. Sorry for the disturbance. Have a great day.";
@@ -1381,6 +1406,14 @@ wss.on("connection", (ws) => {
       isLikelyPickupGreeting(cleanTranscript)
     ) {
       return buildWarmOwnerGreetingReply(memory);
+    }
+
+    if (
+      scriptedNextQuestion === "So are you the business owner?" &&
+      !memory.isBusinessOwner &&
+      isSimpleGreeting(cleanTranscript)
+    ) {
+      return buildOwnerStatusFollowUpReply(memory);
     }
 
     if (scriptedNextQuestion && !looksLikeCustomerQuestion(cleanTranscript)) {

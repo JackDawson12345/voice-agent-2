@@ -2,6 +2,10 @@ function cleanText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
+function cleanAddressPart(value) {
+  return cleanText(value).replace(/^[,;]+|[,;]+$/g, "").trim();
+}
+
 function upperPostcode(value) {
   return cleanText(value).toUpperCase();
 }
@@ -34,9 +38,9 @@ function normaliseCallProfile(raw = {}) {
       phoneNumber: cleanText(
         customer.phone_number || customer.phoneNumber || raw.to
       ),
-      address: cleanText(customer.address),
-      town: cleanText(customer.town),
-      county: cleanText(customer.county),
+      address: cleanAddressPart(customer.address),
+      town: cleanAddressPart(customer.town),
+      county: cleanAddressPart(customer.county),
       postcode: upperPostcode(customer.postcode),
     },
     survey: {
@@ -55,9 +59,15 @@ function normaliseCallProfile(raw = {}) {
 }
 
 function formatCustomerAddress(customer = {}) {
-  return [customer.address, customer.town, customer.county]
-    .map(cleanText)
+  const parts = [customer.address, customer.town, customer.county]
+    .map(cleanAddressPart)
     .filter(Boolean)
+
+  return parts
+    .filter(
+      (part, index) =>
+        index === 0 || part.toLowerCase() !== parts[index - 1].toLowerCase()
+    )
     .join(", ");
 }
 

@@ -383,6 +383,30 @@ function extractDuration(text) {
   );
 }
 
+function looksLikeWebsiteAgeAnswer(text) {
+  const lower = compactText(text);
+
+  if (!lower || isAffirmativeAnswer(lower) || isNegativeAnswer(lower)) {
+    return false;
+  }
+
+  return (
+    Boolean(extractDuration(text)) ||
+    /\bsince\s+\d{4}\b/i.test(lower) ||
+    /\b(?:for|over|about|around)\s+(?:a\s+)?(?:year|month|week|couple|few|long time|while)\b/i.test(lower) ||
+    hasAny(lower, [
+      "a while",
+      "long time",
+      "couple of years",
+      "few years",
+      "few months",
+      "recently",
+      "just launched",
+      "new website",
+    ])
+  );
+}
+
 function extractDateLikeText(text) {
   return (
     extractAfterPatterns(text, [
@@ -469,8 +493,73 @@ function looksLikeOnlineEnquiryAnswer(text) {
       "leads",
       "messages",
       "contact form",
+      "sometimes",
+      "occasionally",
+      "from time to time",
+      "now and then",
+      "every now and then",
     ]) ||
     /\b(yes|no|some|none)\b/i.test(lower)
+  );
+}
+
+function normaliseOnlineEnquiryAnswer(text) {
+  const lower = compactText(text);
+
+  if (!lower) {
+    return null;
+  }
+
+  if (
+    hasAny(lower, [
+      "sometimes",
+      "some times",
+      "occasionally",
+      "from time to time",
+      "now and then",
+      "every now and then",
+    ])
+  ) {
+    return "sometimes";
+  }
+
+  if (isAffirmativeAnswer(lower)) {
+    return "yes";
+  }
+
+  if (isNegativeAnswer(lower) || hasAny(lower, ["none", "never"])) {
+    return "no";
+  }
+
+  if (looksLikeOnlineEnquiryAnswer(text)) {
+    return cleanValue(text);
+  }
+
+  return null;
+}
+
+function looksLikeMoreEnquiriesAnswer(text) {
+  const lower = compactText(text);
+
+  if (!lower) {
+    return false;
+  }
+
+  return (
+    isAffirmativeAnswer(lower) ||
+    isNegativeAnswer(lower) ||
+    hasAny(lower, [
+      "would like",
+      "like to get",
+      "want more enquiries",
+      "want more inquiries",
+      "more enquiries",
+      "more inquiries",
+      "more leads",
+      "more customers",
+      "more business",
+      "yes please",
+    ])
   );
 }
 
@@ -530,6 +619,7 @@ function looksLikeBusinessDetailCorrection(text) {
 
 function isLowConfidenceIndustry(text) {
   const lower = compactText(text);
+  const words = lower.split(/\s+/).filter(Boolean);
 
   if (!lower) {
     return true;
@@ -569,14 +659,73 @@ function isLowConfidenceIndustry(text) {
     "okay",
     "ok",
     "correct",
+    "dude",
+    "mate",
+    "same",
+    "sam's",
+    "sams",
     "still here",
+  ]);
+
+  const commonSingleWordIndustries = new Set([
+    "accounting",
+    "advertising",
+    "automotive",
+    "barber",
+    "beauty",
+    "builder",
+    "building",
+    "catering",
+    "childcare",
+    "cleaning",
+    "construction",
+    "dentistry",
+    "digital",
+    "electrical",
+    "electrician",
+    "fashion",
+    "fitness",
+    "florist",
+    "floristry",
+    "gardening",
+    "hairdressing",
+    "healthcare",
+    "hospitality",
+    "joinery",
+    "landscaping",
+    "legal",
+    "lettings",
+    "marketing",
+    "mechanic",
+    "photography",
+    "plumber",
+    "plumbing",
+    "printing",
+    "property",
+    "retail",
+    "roofing",
+    "security",
+    "tailoring",
+    "telecoms",
+    "telecommunications",
+    "transport",
+    "travel",
+    "wedding",
   ]);
 
   if (blockedValues.has(lower)) {
     return true;
   }
 
-  return lower.split(/\s+/).length === 1 && lower.length <= 2;
+  if (words.length === 1) {
+    if (commonSingleWordIndustries.has(lower)) {
+      return false;
+    }
+
+    return true;
+  }
+
+  return false;
 }
 
 function normaliseCallbackTimeAnswer(text) {
@@ -1330,12 +1479,13 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   }
 
   if (assistantAskedWebsiteAge && shouldStoreRawAnswer(questionRawText)) {
-    setField(
-      memory,
-      "websiteAge",
-      extractDuration(questionRawText) || questionRawText,
-      changedFields
-    );
+    const websiteAgeAnswer = extractDuration(questionRawText) || cleanValue(questionRawText);
+
+    if (looksLikeWebsiteAgeAnswer(questionRawText)) {
+      setField(memory, "websiteAge", websiteAgeAnswer, changedFields);
+    } else {
+      pushNote(memory, `Unclear website age answer: ${questionRawText}`, changedFields);
+    }
   }
 
   if (assistantAskedWebsiteInterest && questionRawText) {
@@ -1349,15 +1499,10 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   }
 
   if (assistantAskedOnlineEnquiries) {
-    if (isAffirmativeAnswer(questionRawText)) {
-      setField(memory, "onlineEnquiryStatus", "yes", changedFields);
-    } else if (isNegativeAnswer(questionRawText)) {
-      setField(memory, "onlineEnquiryStatus", "no", changedFields);
-    } else if (
-      shouldStoreRawAnswer(questionRawText) &&
-      looksLikeOnlineEnquiryAnswer(questionRawText)
-    ) {
-      setField(memory, "onlineEnquiryStatus", questionRawText, changedFields);
+    const onlineEnquiryAnswer = normaliseOnlineEnquiryAnswer(questionRawText);
+
+    if (onlineEnquiryAnswer) {
+      setField(memory, "onlineEnquiryStatus", onlineEnquiryAnswer, changedFields);
     } else if (shouldStoreRawAnswer(questionRawText)) {
       pushNote(
         memory,
@@ -1382,8 +1527,17 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
       setField(memory, "interestInMoreEnquiries", "yes", changedFields);
     } else if (isNegativeAnswer(questionRawText)) {
       setField(memory, "interestInMoreEnquiries", "no", changedFields);
+    } else if (
+      shouldStoreRawAnswer(questionRawText) &&
+      looksLikeMoreEnquiriesAnswer(questionRawText)
+    ) {
+      setField(memory, "interestInMoreEnquiries", cleanValue(questionRawText), changedFields);
     } else if (shouldStoreRawAnswer(questionRawText)) {
-      setField(memory, "interestInMoreEnquiries", questionRawText, changedFields);
+      pushNote(
+        memory,
+        `Unclear more enquiries answer: ${questionRawText}`,
+        changedFields
+      );
     }
   }
 
