@@ -7,6 +7,9 @@ const ELEVENLABS_VOICE_ID =
 
 const ELEVENLABS_MODEL =
   process.env.ELEVENLABS_MODEL || "eleven_flash_v2_5";
+const ELEVENLABS_OPTIMIZE_STREAMING_LATENCY = Number(
+  process.env.ELEVENLABS_OPTIMIZE_STREAMING_LATENCY || 1
+);
 
 const ELEVENLABS_STABILITY = Number(process.env.ELEVENLABS_STABILITY || 0.35);
 const ELEVENLABS_SIMILARITY_BOOST = Number(
@@ -15,6 +18,49 @@ const ELEVENLABS_SIMILARITY_BOOST = Number(
 const ELEVENLABS_STYLE = Number(process.env.ELEVENLABS_STYLE || 0.15);
 const ELEVENLABS_USE_SPEAKER_BOOST =
   process.env.ELEVENLABS_USE_SPEAKER_BOOST !== "false";
+
+function formatDigitsForSpeech(value) {
+  const cleaned = String(value || "").replace(/\s+/g, "");
+
+  return cleaned
+    .replace(/^\+/, "plus ")
+    .split("")
+    .join(" ");
+}
+
+function formatPostcodeForSpeech(value) {
+  const cleaned = String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "");
+
+  if (!/^[A-Z]{2,4}\d[A-Z\d]{2,4}$|^[A-Z]{1,2}\d[A-Z\d]?\d[A-Z]{2}$/.test(cleaned)) {
+    return value;
+  }
+
+  if (cleaned.length <= 4) {
+    return cleaned.split("").join(" ");
+  }
+
+  const outward = cleaned.slice(0, -3).split("").join(" ");
+  const inward = cleaned.slice(-3).split("").join(" ");
+
+  return `${outward}, ${inward}`;
+}
+
+function prepareTextForSpeech(text) {
+  return String(text || "")
+    .replace(
+      /\b([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})\b/gi,
+      (match) => formatPostcodeForSpeech(match)
+    )
+    .replace(
+      /(?<!\w)(\+?\d(?:[\s-]?\d){6,})(?!\w)/g,
+      (match) => formatDigitsForSpeech(match)
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 async function textToSpeech(text) {
   if (!ELEVENLABS_API_KEY) {
@@ -25,10 +71,12 @@ async function textToSpeech(text) {
     return null;
   }
 
+  const preparedText = prepareTextForSpeech(text);
+
   const url =
     `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}` +
     `?output_format=ulaw_8000` +
-    `&optimize_streaming_latency=3`;
+    `&optimize_streaming_latency=${ELEVENLABS_OPTIMIZE_STREAMING_LATENCY}`;
 
   const response = await fetch(url, {
     method: "POST",
@@ -38,7 +86,7 @@ async function textToSpeech(text) {
       Accept: "audio/mulaw",
     },
     body: JSON.stringify({
-      text: text.trim(),
+      text: preparedText,
       model_id: ELEVENLABS_MODEL,
       voice_settings: {
         stability: ELEVENLABS_STABILITY,

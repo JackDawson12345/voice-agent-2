@@ -6,6 +6,10 @@ function upperPostcode(value) {
   return cleanText(value).toUpperCase();
 }
 
+function startsWithAny(text, prefixes) {
+  return prefixes.some((prefix) => text.startsWith(prefix));
+}
+
 function normaliseCallProfile(raw = {}) {
   const customer = raw.customer || {};
   const survey = raw.survey || {};
@@ -138,9 +142,108 @@ function buildCallbackConfirmationMessage(memory = {}) {
     slotText = `${date} in the ${lowerTime}`;
   } else if (lowerTime === "lunchtime") {
     slotText = `${date} at lunchtime`;
+  } else if (
+    startsWithAny(lowerTime, [
+      "after ",
+      "before ",
+      "around ",
+      "between ",
+      "from ",
+      "any time after ",
+      "any time before ",
+    ])
+  ) {
+    slotText = `${date} ${lowerTime}`;
   }
 
   return `Fantastic, thank you. I have arranged the callback for ${slotText}. Please hold onto that for us and we will speak with you then.`;
+}
+
+function inferQuestionKeyFromAssistantReply(reply = "") {
+  const lower = cleanText(reply).toLowerCase();
+
+  if (!lower) {
+    return null;
+  }
+
+  if (
+    lower.includes("who i am speaking with") ||
+    lower.includes("who am i speaking with") ||
+    lower.includes("how should i address you") ||
+    lower.includes("how can i address you") ||
+    lower.includes("what should i call you")
+  ) {
+    return "contact_name";
+  }
+
+  if (lower.includes("are you the business owner")) {
+    return "owner_status";
+  }
+
+  if (
+    lower.includes("authorised to make financial decisions") ||
+    lower.includes("authorized to make financial decisions") ||
+    lower.includes("make financial decisions on behalf of the business")
+  ) {
+    return "financial_authority";
+  }
+
+  if (
+    lower.includes("confirm that your address is") ||
+    lower.includes("confirm your address is") ||
+    lower.includes("confirm that the postcode is")
+  ) {
+    return "address_confirmation";
+  }
+
+  if (
+    lower.includes("business name as") ||
+    lower.includes("business number as") ||
+    lower.includes("business number")
+  ) {
+    return "business_details_confirmation";
+  }
+
+  if (lower.includes("currently have a website")) {
+    return "website_status";
+  }
+
+  if (lower.includes("how long have you had the website")) {
+    return "website_age";
+  }
+
+  if (lower.includes("considered getting a website")) {
+    return "website_interest";
+  }
+
+  if (lower.includes("get enquiries online from new customers")) {
+    return "online_enquiries";
+  }
+
+  if (lower.includes("like to get enquiries or more enquiries online")) {
+    return "more_enquiries";
+  }
+
+  if (lower.includes("classification or industry")) {
+    return "industry";
+  }
+
+  if (
+    lower.includes("to thank you for taking part in the survey") ||
+    lower.includes("no cost basic listing")
+  ) {
+    return "callback_consent";
+  }
+
+  if (lower.includes("what day would suit")) {
+    return "callback_day";
+  }
+
+  if (lower.includes("what time would suit")) {
+    return "callback_time";
+  }
+
+  return null;
 }
 
 function getScriptedNextQuestion(
@@ -315,5 +418,6 @@ module.exports = {
   hasCallbackSlot,
   hasSurveyAnswers,
   hasWebsiteBranchDetail,
+  inferQuestionKeyFromAssistantReply,
   normaliseCallProfile,
 };

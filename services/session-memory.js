@@ -56,12 +56,36 @@ function normaliseSpeechText(value) {
     .trim();
 }
 
-function getLastAssistantMessage(conversationHistory = []) {
+function isPresenceCheckMessage(text) {
+  const lower = compactText(text);
+
+  return (
+    lower.includes("are you still there") ||
+    lower.includes("still on the line")
+  );
+}
+
+function getLastAssistantMessage(conversationHistory = [], options = {}) {
+  const preferredPromptText = cleanValue(options.preferredPromptText);
+
+  if (preferredPromptText) {
+    return preferredPromptText;
+  }
+
   for (let index = conversationHistory.length - 1; index >= 0; index -= 1) {
     const message = conversationHistory[index];
 
     if (message && message.role === "assistant" && message.content) {
-      return String(message.content);
+      const content = String(message.content);
+
+      if (
+        options.skipGenericPresenceChecks !== false &&
+        isPresenceCheckMessage(content)
+      ) {
+        continue;
+      }
+
+      return content;
     }
   }
 
@@ -73,7 +97,7 @@ function hasAny(text, phrases) {
 }
 
 function isSimpleYes(text) {
-  return /^(?:yes|yeah|yep|yeh|sure|okay|ok|correct|that'?s right|fine|go ahead|please do|happy to)[.!?\s]*$/i.test(
+  return /^(?:yes|yeah|yep|yeh|sure|okay|ok|correct|that'?s right|that is right|that is correct|it is|fine|go ahead|please do|happy to)[.!?\s]*$/i.test(
     cleanValue(text)
   );
 }
@@ -95,7 +119,7 @@ function isAffirmativeAnswer(text) {
     return true;
   }
 
-  return /\b(yes|yeah|yep|yeh|sure|okay|ok|correct|that'?s right|go ahead|please do|happy to|i do|we do|i am|we are|i have|we have)\b/i.test(
+  return /\b(yes|yeah|yep|yeh|sure|okay|ok|correct|that'?s right|that is right|that is correct|go ahead|please do|happy to|i do|we do|i am|we are|i have|we have|it is)\b/i.test(
     lower
   );
 }
@@ -177,12 +201,35 @@ function stripLeadingPhrase(text, patterns) {
 }
 
 function extractPersonName(text) {
-  return (
+  const candidate =
     extractAfterPatterns(text, [
       /(?:my name is|this is|i am|i'm)\s+([a-z][a-z .'-]{1,60})$/i,
       /(?:hello|hi|hiya)?[\s,.]*([a-z][a-z .'-]{1,60})\s+(?:speaking|here)$/i,
-    ]) || null
-  );
+    ]) || null;
+
+  if (!candidate) {
+    return null;
+  }
+
+  const lower = compactText(candidate);
+
+  if (
+    lower.startsWith("a ") ||
+    lower.startsWith("the ") ||
+    hasAny(lower, [
+      "owner",
+      "director",
+      "manager",
+      "marketing",
+      "website",
+      "advertising",
+      "business owner",
+    ])
+  ) {
+    return null;
+  }
+
+  return candidate;
 }
 
 function extractBusinessName(text) {
@@ -220,6 +267,18 @@ function normaliseIndustryAnswer(text) {
     /^(?:it is|it's|we are|we're)[,.\s-]+/i,
     /^(?:a|an)\s+/i,
   ]);
+}
+
+function stripPresenceCheckPrefix(text) {
+  let value = cleanValue(text);
+
+  value = value.replace(/^(?:yes|yeah|yep|yeh|hello|hi|okay|ok)[,.\s-]*/i, "");
+  value = value.replace(
+    /^(?:(?:i am|i'm|we are|we're)\s+)?(?:still here|still there|still on the line|here on the line|on the line)\b[,.\s-]*/i,
+    ""
+  );
+
+  return cleanValue(value);
 }
 
 function normaliseSingleWordToken(token) {
@@ -328,6 +387,11 @@ function extractDateLikeText(text) {
 function extractTimeLikeText(text) {
   return (
     extractAfterPatterns(text, [
+      /\b(after lunchtime|after lunch|before lunchtime|before lunch|around lunchtime|around lunch|late morning|early morning|early afternoon|late afternoon)\b/i,
+      /\b(any time after\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b/i,
+      /\b(any time before\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b/i,
+      /\b(between\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s+and\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b/i,
+      /\b(from\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s+(?:to|until)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b/i,
       /\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b/i,
       /\b(\d{1,2}\s*o'?clock)\b/i,
       /\b((?:morning|afternoon|evening|lunchtime))\b/i,
@@ -393,6 +457,147 @@ function looksLikeOnlineEnquiryAnswer(text) {
   );
 }
 
+function normaliseDecisionMakerRole(text) {
+  const lower = compactText(text);
+
+  if (!lower) {
+    return null;
+  }
+
+  if (hasAny(lower, ["owner", "business owner"])) {
+    return "owner";
+  }
+
+  if (lower.includes("director")) {
+    return "director";
+  }
+
+  if (lower.includes("marketing")) {
+    return "marketing";
+  }
+
+  if (lower.includes("manager")) {
+    return "manager";
+  }
+
+  if (lower.includes("website")) {
+    return "website";
+  }
+
+  if (lower.includes("advertising")) {
+    return "advertising";
+  }
+
+  return extractRole(text);
+}
+
+function looksLikeAddressCorrection(text) {
+  if (extractUkPostcode(text)) {
+    return true;
+  }
+
+  const candidate = normaliseBusinessAddressAnswer(text);
+
+  return Boolean(candidate && candidate.split(/\s+/).length >= 3);
+}
+
+function looksLikeBusinessDetailCorrection(text) {
+  if (extractBusinessName(text) || extractPhoneNumber(text)) {
+    return true;
+  }
+
+  const candidate = normaliseBusinessNameAnswer(text);
+
+  return Boolean(candidate && candidate.split(/\s+/).length >= 2);
+}
+
+function isLowConfidenceIndustry(text) {
+  const lower = compactText(text);
+
+  if (!lower) {
+    return true;
+  }
+
+  const blockedValues = new Set([
+    "alpha",
+    "bravo",
+    "charlie",
+    "delta",
+    "echo",
+    "foxtrot",
+    "golf",
+    "hotel",
+    "india",
+    "juliet",
+    "juliett",
+    "kilo",
+    "lima",
+    "mike",
+    "november",
+    "oscar",
+    "papa",
+    "quebec",
+    "romeo",
+    "sierra",
+    "tango",
+    "uniform",
+    "victor",
+    "whiskey",
+    "xray",
+    "x-ray",
+    "yankee",
+    "zulu",
+    "yes",
+    "no",
+    "okay",
+    "ok",
+    "correct",
+    "still here",
+  ]);
+
+  if (blockedValues.has(lower)) {
+    return true;
+  }
+
+  return lower.split(/\s+/).length === 1 && lower.length <= 2;
+}
+
+function normaliseCallbackTimeAnswer(text) {
+  const candidate = cleanValue(text);
+  const lower = compactText(candidate);
+
+  if (!lower) {
+    return null;
+  }
+
+  const normalisedMappings = new Map([
+    ["after lunch", "after lunchtime"],
+    ["after lunchtime", "after lunchtime"],
+    ["before lunch", "before lunchtime"],
+    ["before lunchtime", "before lunchtime"],
+    ["around lunch", "around lunchtime"],
+    ["around lunchtime", "around lunchtime"],
+  ]);
+
+  if (normalisedMappings.has(lower)) {
+    return normalisedMappings.get(lower);
+  }
+
+  const extracted = extractTimeLikeText(candidate);
+
+  if (!extracted) {
+    return null;
+  }
+
+  const extractedLower = compactText(extracted);
+
+  if (normalisedMappings.has(extractedLower)) {
+    return normalisedMappings.get(extractedLower);
+  }
+
+  return cleanValue(extractedLower);
+}
+
 function setField(memory, field, value, changedFields) {
   const cleanedValue = typeof value === "string" ? cleanValue(value) : value;
 
@@ -431,12 +636,29 @@ function shouldStoreRawAnswer(rawText) {
   return Boolean(rawText && !isSimpleYes(rawText) && !isSimpleNo(rawText));
 }
 
+function promptMatches(promptKey, expectedKey, fallbackText, patterns) {
+  if (promptKey) {
+    return promptKey === expectedKey;
+  }
+
+  return hasAny(fallbackText, patterns);
+}
+
 function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   const changedFields = [];
   const rawText = cleanValue(transcript);
-  const speechText = normaliseSpeechText(rawText);
+  const strippedPresenceText = stripPresenceCheckPrefix(rawText);
+  const hasPresencePrefix = strippedPresenceText !== rawText;
+  const questionRawText =
+    hasPresencePrefix && !strippedPresenceText ? "" : strippedPresenceText || rawText;
+  const speechText = normaliseSpeechText(questionRawText || rawText);
   const lower = rawText.toLowerCase();
-  const lastAssistant = getLastAssistantMessage(context.conversationHistory || []);
+  const questionLower = questionRawText.toLowerCase();
+  const promptKey = cleanValue(context.promptKey).toLowerCase();
+  const lastAssistant = getLastAssistantMessage(context.conversationHistory || [], {
+    preferredPromptText: context.promptText,
+    skipGenericPresenceChecks: true,
+  });
   const lastAssistantLower = lastAssistant.toLowerCase();
   const callProfile = context.callProfile || {};
   const callProfileCustomer = callProfile.customer || {};
@@ -514,132 +736,232 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     setField(memory, "interestInMoreEnquiries", "no", changedFields);
   }
 
-  const assistantAskedContactName = hasAny(lastAssistantLower, [
-    "who i am speaking with",
-    "who am i speaking with",
-    "who am i speaking to",
-    "who am i speaking with please",
-    "how should i address you",
-    "how can i address you",
-    "what should i call you",
-  ]);
+  const assistantAskedContactName = promptMatches(
+    promptKey,
+    "contact_name",
+    lastAssistantLower,
+    [
+      "who i am speaking with",
+      "who am i speaking with",
+      "who am i speaking to",
+      "who am i speaking with please",
+      "how should i address you",
+      "how can i address you",
+      "what should i call you",
+    ]
+  );
 
-  const assistantAskedBusinessName = hasAny(lastAssistantLower, [
-    "name of your business",
-    "right business",
-    "business please",
-    "business name",
-  ]);
+  const assistantAskedBusinessName = promptMatches(
+    promptKey,
+    "business_name",
+    lastAssistantLower,
+    [
+      "name of your business",
+      "right business",
+      "business please",
+      "business name",
+    ]
+  );
 
-  const assistantAskedBusinessAddress = hasAny(lastAssistantLower, [
-    "best address for the business",
-    "best address for your business",
-    "confirm the best address",
-    "business address",
-  ]);
+  const assistantAskedBusinessAddress = promptMatches(
+    promptKey,
+    "business_address",
+    lastAssistantLower,
+    [
+      "best address for the business",
+      "best address for your business",
+      "confirm the best address",
+      "business address",
+    ]
+  );
 
-  const assistantAskedPostcode = hasAny(lastAssistantLower, [
+  const assistantAskedPostcode = promptMatches(
+    promptKey,
     "postcode",
-    "post code",
-  ]);
+    lastAssistantLower,
+    [
+      "postcode",
+      "post code",
+    ]
+  );
 
-  const assistantAskedDecisionMaker = hasAny(lastAssistantLower, [
-    "looks after decisions around advertising",
-    "websites or online marketing",
-    "responsible for advertising",
-  ]);
+  const assistantAskedDecisionMaker = promptMatches(
+    promptKey,
+    "decision_maker",
+    lastAssistantLower,
+    [
+      "looks after decisions around advertising",
+      "websites or online marketing",
+      "responsible for advertising",
+    ]
+  );
 
-  const assistantAskedOwnerStatus = hasAny(lastAssistantLower, [
-    "are you the business owner",
-  ]);
+  const assistantAskedOwnerStatus = promptMatches(
+    promptKey,
+    "owner_status",
+    lastAssistantLower,
+    [
+      "are you the business owner",
+    ]
+  );
 
-  const assistantAskedFinancialAuthority = hasAny(lastAssistantLower, [
-    "authorised to make financial decisions",
-    "authorized to make financial decisions",
-    "make financial decisions on behalf of the business",
-  ]);
+  const assistantAskedFinancialAuthority = promptMatches(
+    promptKey,
+    "financial_authority",
+    lastAssistantLower,
+    [
+      "authorised to make financial decisions",
+      "authorized to make financial decisions",
+      "make financial decisions on behalf of the business",
+    ]
+  );
 
-  const assistantAskedAddressConfirmation = hasAny(lastAssistantLower, [
-    "confirm that your address is",
-    "confirm your address is",
-    "confirm that the postcode is",
-  ]);
+  const assistantAskedAddressConfirmation = promptMatches(
+    promptKey,
+    "address_confirmation",
+    lastAssistantLower,
+    [
+      "confirm that your address is",
+      "confirm your address is",
+      "confirm that the postcode is",
+    ]
+  );
 
-  const assistantAskedBusinessDetailsConfirmation = hasAny(lastAssistantLower, [
-    "business name as",
-    "business number as",
-    "business number",
-  ]);
+  const assistantAskedBusinessDetailsConfirmation = promptMatches(
+    promptKey,
+    "business_details_confirmation",
+    lastAssistantLower,
+    [
+      "business name as",
+      "business number as",
+      "business number",
+    ]
+  );
 
-  const assistantAskedDecisionMakerName = hasAny(lastAssistantLower, [
-    "who would normally handle those decisions",
-    "who handles those decisions",
-    "who would handle that",
-  ]);
+  const assistantAskedDecisionMakerName = promptMatches(
+    promptKey,
+    "decision_maker_name",
+    lastAssistantLower,
+    [
+      "who would normally handle those decisions",
+      "who handles those decisions",
+      "who would handle that",
+    ]
+  );
 
-  const assistantAskedDecisionMakerRole = hasAny(lastAssistantLower, [
-    "what is their role",
-    "what's their role",
-    "role at the business",
-  ]);
+  const assistantAskedDecisionMakerRole = promptMatches(
+    promptKey,
+    "decision_maker_role",
+    lastAssistantLower,
+    [
+      "what is their role",
+      "what's their role",
+      "role at the business",
+    ]
+  );
 
-  const assistantAskedWebsiteStatus = hasAny(lastAssistantLower, [
-    "currently have a website",
-    "have a website for your business",
-    "do you currently have a website",
-  ]);
+  const assistantAskedWebsiteStatus = promptMatches(
+    promptKey,
+    "website_status",
+    lastAssistantLower,
+    [
+      "currently have a website",
+      "have a website for your business",
+      "do you currently have a website",
+    ]
+  );
 
-  const assistantAskedWebsiteAge = hasAny(lastAssistantLower, [
-    "how long have you had your website",
-    "how long have you had the website",
-  ]);
+  const assistantAskedWebsiteAge = promptMatches(
+    promptKey,
+    "website_age",
+    lastAssistantLower,
+    [
+      "how long have you had your website",
+      "how long have you had the website",
+    ]
+  );
 
-  const assistantAskedWebsiteInterest = hasAny(lastAssistantLower, [
-    "considered getting a website",
-    "help customers find your business online",
-    "considered getting a website for your business",
-  ]);
+  const assistantAskedWebsiteInterest = promptMatches(
+    promptKey,
+    "website_interest",
+    lastAssistantLower,
+    [
+      "considered getting a website",
+      "help customers find your business online",
+      "considered getting a website for your business",
+    ]
+  );
 
-  const assistantAskedOnlineEnquiries = hasAny(lastAssistantLower, [
-    "receive enquiries",
-    "online searches",
-    "through online searches or your website",
-    "get enquiries online from new customers",
-  ]);
+  const assistantAskedOnlineEnquiries = promptMatches(
+    promptKey,
+    "online_enquiries",
+    lastAssistantLower,
+    [
+      "receive enquiries",
+      "online searches",
+      "through online searches or your website",
+      "get enquiries online from new customers",
+    ]
+  );
 
-  const assistantAskedMoreEnquiries = hasAny(lastAssistantLower, [
-    "interested in receiving more enquiries",
-    "more enquiries from customers searching online",
-    "like to get enquiries or more enquiries online",
-  ]);
+  const assistantAskedMoreEnquiries = promptMatches(
+    promptKey,
+    "more_enquiries",
+    lastAssistantLower,
+    [
+      "interested in receiving more enquiries",
+      "more enquiries from customers searching online",
+      "like to get enquiries or more enquiries online",
+    ]
+  );
 
-  const assistantAskedIndustry = hasAny(lastAssistantLower, [
-    "type of business or industry",
-    "what type of business",
-    "what industry are you in",
-    "classification or industry",
-  ]);
+  const assistantAskedIndustry = promptMatches(
+    promptKey,
+    "industry",
+    lastAssistantLower,
+    [
+      "type of business or industry",
+      "what type of business",
+      "what industry are you in",
+      "classification or industry",
+    ]
+  );
 
-  const assistantAskedCallbackConsent = hasAny(lastAssistantLower, [
-    "to thank you for taking part in the survey",
-    "no cost basic listing",
-    "is that ok",
-    "is that okay",
-  ]);
+  const assistantAskedCallbackConsent = promptMatches(
+    promptKey,
+    "callback_consent",
+    lastAssistantLower,
+    [
+      "to thank you for taking part in the survey",
+      "no cost basic listing",
+      "is that ok",
+      "is that okay",
+    ]
+  );
 
-  const assistantAskedCallbackDay = hasAny(lastAssistantLower, [
-    "what day would suit you best",
-    "what day would be better",
-    "what day would suit them best",
-    "what day would suit best",
-  ]);
+  const assistantAskedCallbackDay = promptMatches(
+    promptKey,
+    "callback_day",
+    lastAssistantLower,
+    [
+      "what day would suit you best",
+      "what day would be better",
+      "what day would suit them best",
+      "what day would suit best",
+    ]
+  );
 
-  const assistantAskedCallbackTime = hasAny(lastAssistantLower, [
-    "what time would suit you best",
-    "what time would suit them best",
-    "what time works best",
-    "what time would suit best",
-  ]);
+  const assistantAskedCallbackTime = promptMatches(
+    promptKey,
+    "callback_time",
+    lastAssistantLower,
+    [
+      "what time would suit you best",
+      "what time would suit them best",
+      "what time works best",
+      "what time would suit best",
+    ]
+  );
 
   const assistantAskedCallbackGeneral = hasAny(lastAssistantLower, [
     "better time for us to call you back",
@@ -649,16 +971,16 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   ]);
 
   const contactName =
-    extractPersonName(speechText) || extractPersonName(rawText) || null;
-  const contactTitle = extractHonorific(rawText);
+    extractPersonName(speechText) || extractPersonName(questionRawText) || null;
+  const contactTitle = extractHonorific(questionRawText);
 
   if (contactName && (!memory.contactName || assistantAskedContactName)) {
     setField(memory, "contactName", contactName, changedFields);
-  } else if (assistantAskedContactName && shouldStoreRawAnswer(rawText)) {
+  } else if (assistantAskedContactName && shouldStoreRawAnswer(questionRawText)) {
     setField(
       memory,
       "contactName",
-      normaliseContactNameAnswer(rawText) || rawText,
+      normaliseContactNameAnswer(questionRawText) || questionRawText,
       changedFields
     );
   }
@@ -668,9 +990,9 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   }
 
   const businessName =
-    extractBusinessName(rawText) ||
-    (assistantAskedBusinessName && shouldStoreRawAnswer(rawText)
-      ? normaliseBusinessNameAnswer(rawText)
+    extractBusinessName(questionRawText) ||
+    (assistantAskedBusinessName && shouldStoreRawAnswer(questionRawText)
+      ? normaliseBusinessNameAnswer(questionRawText)
       : null);
 
   if (businessName && !memory.wrongNumber) {
@@ -678,14 +1000,30 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     setField(memory, "correctBusinessConfirmed", "yes", changedFields);
   }
 
-  const postcode = extractUkPostcode(rawText);
+  const postcode = extractUkPostcode(questionRawText || rawText);
 
   if (postcode) {
     setField(memory, "postcode", postcode, changedFields);
   }
 
   if (assistantAskedAddressConfirmation) {
-    if (isAffirmativeAnswer(rawText)) {
+    if (isNegativeAnswer(questionRawText)) {
+      setField(memory, "addressConfirmed", "no", changedFields);
+
+      if (looksLikeAddressCorrection(questionRawText)) {
+        if (postcode) {
+          setField(memory, "postcode", postcode, changedFields);
+        }
+
+        const correctedAddress = normaliseBusinessAddressAnswer(questionRawText);
+
+        if (correctedAddress) {
+          setField(memory, "businessAddress", correctedAddress, changedFields);
+        }
+      } else if (shouldStoreRawAnswer(questionRawText)) {
+        pushNote(memory, `Address correction: ${questionRawText}`, changedFields);
+      }
+    } else if (isAffirmativeAnswer(questionRawText)) {
       setField(memory, "addressConfirmed", "yes", changedFields);
 
       if (knownBusinessAddressLine || knownBusinessAddress) {
@@ -700,46 +1038,67 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
       if (knownPostcode) {
         setField(memory, "postcode", knownPostcode, changedFields);
       }
-    } else if (isNegativeAnswer(rawText) || shouldStoreRawAnswer(rawText)) {
+    } else if (looksLikeAddressCorrection(questionRawText)) {
       setField(memory, "addressConfirmed", "no", changedFields);
 
       if (postcode) {
         setField(memory, "postcode", postcode, changedFields);
       }
 
-      if (shouldStoreRawAnswer(rawText) && !isNegativeAnswer(rawText)) {
+      if (shouldStoreRawAnswer(questionRawText)) {
         setField(
           memory,
           "businessAddress",
-          normaliseBusinessAddressAnswer(rawText),
+          normaliseBusinessAddressAnswer(questionRawText),
           changedFields
         );
-      } else if (shouldStoreRawAnswer(rawText)) {
-        pushNote(memory, `Address correction: ${rawText}`, changedFields);
       }
     }
   }
 
   if (
     assistantAskedBusinessAddress &&
-    shouldStoreRawAnswer(rawText) &&
+    shouldStoreRawAnswer(questionRawText) &&
     !memory.wrongNumber
   ) {
     setField(
       memory,
       "businessAddress",
-      normaliseBusinessAddressAnswer(rawText),
+      normaliseBusinessAddressAnswer(questionRawText),
       changedFields
     );
     setField(memory, "correctBusinessConfirmed", "yes", changedFields);
   }
 
-  if (assistantAskedPostcode && shouldStoreRawAnswer(rawText)) {
-    setField(memory, "postcode", postcode || rawText, changedFields);
+  if (assistantAskedPostcode && shouldStoreRawAnswer(questionRawText)) {
+    setField(memory, "postcode", postcode || questionRawText, changedFields);
   }
 
   if (assistantAskedBusinessDetailsConfirmation) {
-    if (isAffirmativeAnswer(rawText)) {
+    if (isNegativeAnswer(questionRawText)) {
+      setField(memory, "businessDetailsConfirmed", "no", changedFields);
+
+      if (looksLikeBusinessDetailCorrection(questionRawText)) {
+        const correctedBusinessName =
+          extractBusinessName(questionRawText) ||
+          normaliseBusinessNameAnswer(questionRawText);
+        const correctedPhoneNumber = extractPhoneNumber(questionRawText);
+
+        if (correctedBusinessName) {
+          setField(memory, "businessName", correctedBusinessName, changedFields);
+        }
+
+        if (correctedPhoneNumber) {
+          setField(memory, "phoneNumber", correctedPhoneNumber, changedFields);
+        }
+      } else if (shouldStoreRawAnswer(questionRawText)) {
+        pushNote(
+          memory,
+          `Business detail correction: ${questionRawText}`,
+          changedFields
+        );
+      }
+    } else if (isAffirmativeAnswer(questionRawText)) {
       setField(memory, "businessDetailsConfirmed", "yes", changedFields);
       setField(memory, "correctBusinessConfirmed", "yes", changedFields);
 
@@ -750,31 +1109,28 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
       if (knownBusinessPhone) {
         setField(memory, "phoneNumber", knownBusinessPhone, changedFields);
       }
-    } else if (isNegativeAnswer(rawText) || shouldStoreRawAnswer(rawText)) {
+    } else if (looksLikeBusinessDetailCorrection(questionRawText)) {
       setField(memory, "businessDetailsConfirmed", "no", changedFields);
 
       const correctedBusinessName =
-        extractBusinessName(rawText) || normaliseBusinessNameAnswer(rawText);
-      const correctedPhoneNumber = extractPhoneNumber(rawText);
+        extractBusinessName(questionRawText) ||
+        normaliseBusinessNameAnswer(questionRawText);
+      const correctedPhoneNumber = extractPhoneNumber(questionRawText);
 
-      if (correctedBusinessName && !isNegativeAnswer(rawText)) {
+      if (correctedBusinessName) {
         setField(memory, "businessName", correctedBusinessName, changedFields);
       }
 
       if (correctedPhoneNumber) {
         setField(memory, "phoneNumber", correctedPhoneNumber, changedFields);
       }
-
-      if (shouldStoreRawAnswer(rawText)) {
-        pushNote(memory, `Business detail correction: ${rawText}`, changedFields);
-      }
     }
   }
 
   if (assistantAskedOwnerStatus) {
     if (
-      isAffirmativeAnswer(rawText) ||
-      hasAny(lower, [
+      isAffirmativeAnswer(questionRawText) ||
+      hasAny(questionLower, [
         "i am the owner",
         "i'm the owner",
         "i own it",
@@ -785,11 +1141,12 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
       setField(memory, "isBusinessOwner", "yes", changedFields);
       setField(memory, "authorisedDecisionMaker", "yes", changedFields);
       setField(memory, "isDecisionMaker", "yes", changedFields);
+      setField(memory, "decisionMakerRole", "owner", changedFields);
     }
 
     if (
-      isNegativeAnswer(rawText) ||
-      hasAny(lower, [
+      isNegativeAnswer(questionRawText) ||
+      hasAny(questionLower, [
         "not the owner",
         "i am not the owner",
         "i'm not the owner",
@@ -801,8 +1158,8 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
 
   if (assistantAskedFinancialAuthority) {
     if (
-      isAffirmativeAnswer(rawText) ||
-      hasAny(lower, [
+      isAffirmativeAnswer(questionRawText) ||
+      hasAny(questionLower, [
         "i can",
         "yes i do",
         "i handle that",
@@ -814,8 +1171,8 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     }
 
     if (
-      isNegativeAnswer(rawText) ||
-      hasAny(lower, [
+      isNegativeAnswer(questionRawText) ||
+      hasAny(questionLower, [
         "i cannot",
         "i don't",
         "i do not",
@@ -829,8 +1186,8 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
 
   if (assistantAskedDecisionMaker) {
     if (
-      isAffirmativeAnswer(rawText) ||
-      hasAny(lower, [
+      isAffirmativeAnswer(questionRawText) ||
+      hasAny(questionLower, [
         "i am the owner",
         "i'm the owner",
         "i own it",
@@ -843,8 +1200,8 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     }
 
     if (
-      isNegativeAnswer(rawText) ||
-      hasAny(lower, [
+      isNegativeAnswer(questionRawText) ||
+      hasAny(questionLower, [
         "that isn't me",
         "that's not me",
         "someone else handles that",
@@ -856,7 +1213,7 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   }
 
   if (
-    hasAny(lower, [
+    hasAny(questionLower, [
       "i am the owner",
       "i'm the owner",
       "i own the business",
@@ -868,6 +1225,7 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     setField(memory, "isBusinessOwner", "yes", changedFields);
     setField(memory, "authorisedDecisionMaker", "yes", changedFields);
     setField(memory, "isDecisionMaker", "yes", changedFields);
+    setField(memory, "decisionMakerRole", "owner", changedFields);
   }
 
   if (memory.isDecisionMaker === "yes" && memory.contactName && !memory.decisionMakerName) {
@@ -877,20 +1235,36 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   if (
     memory.isDecisionMaker === "yes" &&
     !memory.decisionMakerRole &&
-    hasAny(lower, ["owner", "director", "manager", "marketing"])
+    hasAny(questionLower, ["owner", "director", "manager", "marketing"])
   ) {
-    setField(memory, "decisionMakerRole", extractRole(rawText) || rawText, changedFields);
+    setField(
+      memory,
+      "decisionMakerRole",
+      normaliseDecisionMakerRole(questionRawText),
+      changedFields
+    );
   }
 
-  if (assistantAskedDecisionMakerName && shouldStoreRawAnswer(rawText)) {
-    setField(memory, "decisionMakerName", contactName || rawText, changedFields);
+  if (assistantAskedDecisionMakerName && shouldStoreRawAnswer(questionRawText)) {
+    setField(
+      memory,
+      "decisionMakerName",
+      contactName || questionRawText,
+      changedFields
+    );
   }
 
-  if (assistantAskedDecisionMakerRole && shouldStoreRawAnswer(rawText)) {
-    setField(memory, "decisionMakerRole", extractRole(rawText) || rawText, changedFields);
+  if (assistantAskedDecisionMakerRole && shouldStoreRawAnswer(questionRawText)) {
+    const normalisedRole = normaliseDecisionMakerRole(questionRawText);
+
+    if (normalisedRole) {
+      setField(memory, "decisionMakerRole", normalisedRole, changedFields);
+    } else {
+      pushNote(memory, `Unclear decision maker role: ${questionRawText}`, changedFields);
+    }
   }
 
-  const websiteAddress = extractWebsiteAddress(rawText);
+  const websiteAddress = extractWebsiteAddress(questionRawText);
 
   if (websiteAddress) {
     setField(memory, "websiteStatus", "yes", changedFields);
@@ -899,15 +1273,15 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
 
   if (assistantAskedWebsiteStatus) {
     if (
-      isAffirmativeAnswer(rawText) ||
-      hasAny(lower, ["we do", "i do", "we have one", "i have one", "got one"])
+      isAffirmativeAnswer(questionRawText) ||
+      hasAny(questionLower, ["we do", "i do", "we have one", "i have one", "got one"])
     ) {
       setField(memory, "websiteStatus", "yes", changedFields);
     }
 
     if (
-      isNegativeAnswer(rawText) ||
-      hasAny(lower, [
+      isNegativeAnswer(questionRawText) ||
+      hasAny(questionLower, [
         "no website",
         "don't have a website",
         "do not have a website",
@@ -918,53 +1292,83 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     }
   }
 
-  if (assistantAskedWebsiteAge && shouldStoreRawAnswer(rawText)) {
-    setField(memory, "websiteAge", extractDuration(rawText) || rawText, changedFields);
+  if (assistantAskedWebsiteAge && shouldStoreRawAnswer(questionRawText)) {
+    setField(
+      memory,
+      "websiteAge",
+      extractDuration(questionRawText) || questionRawText,
+      changedFields
+    );
   }
 
-  if (assistantAskedWebsiteInterest && rawText) {
-    if (isAffirmativeAnswer(rawText)) {
+  if (assistantAskedWebsiteInterest && questionRawText) {
+    if (isAffirmativeAnswer(questionRawText)) {
       setField(memory, "websiteInterestLevel", "yes", changedFields);
-    } else if (isNegativeAnswer(rawText)) {
+    } else if (isNegativeAnswer(questionRawText)) {
       setField(memory, "websiteInterestLevel", "no", changedFields);
     } else {
-      setField(memory, "websiteInterestLevel", rawText, changedFields);
+      setField(memory, "websiteInterestLevel", questionRawText, changedFields);
     }
   }
 
   if (assistantAskedOnlineEnquiries) {
-    if (isAffirmativeAnswer(rawText)) {
+    if (isAffirmativeAnswer(questionRawText)) {
       setField(memory, "onlineEnquiryStatus", "yes", changedFields);
-    } else if (isNegativeAnswer(rawText)) {
+    } else if (isNegativeAnswer(questionRawText)) {
       setField(memory, "onlineEnquiryStatus", "no", changedFields);
-    } else if (shouldStoreRawAnswer(rawText) && looksLikeOnlineEnquiryAnswer(rawText)) {
-      setField(memory, "onlineEnquiryStatus", rawText, changedFields);
-    } else if (shouldStoreRawAnswer(rawText)) {
-      pushNote(memory, `Unclear online enquiry answer: ${rawText}`, changedFields);
+    } else if (
+      shouldStoreRawAnswer(questionRawText) &&
+      looksLikeOnlineEnquiryAnswer(questionRawText)
+    ) {
+      setField(memory, "onlineEnquiryStatus", questionRawText, changedFields);
+    } else if (shouldStoreRawAnswer(questionRawText)) {
+      pushNote(
+        memory,
+        `Unclear online enquiry answer: ${questionRawText}`,
+        changedFields
+      );
     }
   }
 
   if (assistantAskedMoreEnquiries) {
-    if (isAffirmativeAnswer(rawText)) {
+    if (
+      isAffirmativeAnswer(questionRawText) ||
+      hasAny(questionLower, [
+        "would like",
+        "like to get",
+        "want more enquiries",
+        "want more inquiries",
+        "more enquiries",
+        "more inquiries",
+      ])
+    ) {
       setField(memory, "interestInMoreEnquiries", "yes", changedFields);
-    } else if (isNegativeAnswer(rawText)) {
+    } else if (isNegativeAnswer(questionRawText)) {
       setField(memory, "interestInMoreEnquiries", "no", changedFields);
-    } else if (shouldStoreRawAnswer(rawText)) {
-      setField(memory, "interestInMoreEnquiries", rawText, changedFields);
+    } else if (shouldStoreRawAnswer(questionRawText)) {
+      setField(memory, "interestInMoreEnquiries", questionRawText, changedFields);
     }
   }
 
   const inferredIndustry =
-    inferIndustryFromText(rawText) || inferIndustryFromText(memory.businessName);
+    inferIndustryFromText(questionRawText) || inferIndustryFromText(memory.businessName);
 
-  if (assistantAskedIndustry && shouldStoreRawAnswer(rawText)) {
-    setField(memory, "industry", normaliseIndustryAnswer(rawText), changedFields);
+  if (assistantAskedIndustry && shouldStoreRawAnswer(questionRawText)) {
+    const normalisedIndustry =
+      inferIndustryFromText(questionRawText) ||
+      normaliseIndustryAnswer(questionRawText);
+
+    if (normalisedIndustry && !isLowConfidenceIndustry(normalisedIndustry)) {
+      setField(memory, "industry", normalisedIndustry, changedFields);
+    } else {
+      pushNote(memory, `Unclear industry answer: ${questionRawText}`, changedFields);
+    }
   } else if (!memory.industry && inferredIndustry) {
     setField(memory, "industry", inferredIndustry, changedFields);
   }
 
-  const callbackDate = extractDateLikeText(rawText);
-  const callbackTime = extractTimeLikeText(rawText);
+  const callbackDate = extractDateLikeText(questionRawText);
+  const callbackTime = normaliseCallbackTimeAnswer(questionRawText);
 
   if (callbackDate) {
     setField(memory, "callbackDate", callbackDate, changedFields);
@@ -977,28 +1381,32 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   }
 
   if (assistantAskedCallbackConsent) {
-    if (isAffirmativeAnswer(rawText)) {
+    if (isAffirmativeAnswer(questionRawText)) {
       setField(memory, "callbackConsent", "yes", changedFields);
       setField(memory, "callbackRequested", true, changedFields);
-    } else if (isNegativeAnswer(rawText)) {
+    } else if (isNegativeAnswer(questionRawText)) {
       setField(memory, "callbackConsent", "no", changedFields);
       setField(memory, "callbackRequested", true, changedFields);
     }
   }
 
-  if (assistantAskedCallbackDay && shouldStoreRawAnswer(rawText)) {
-    setField(memory, "callbackDate", callbackDate || rawText, changedFields);
+  if (assistantAskedCallbackDay && shouldStoreRawAnswer(questionRawText)) {
+    setField(memory, "callbackDate", callbackDate || questionRawText, changedFields);
     setField(memory, "callbackRequested", true, changedFields);
   }
 
-  if (assistantAskedCallbackTime && shouldStoreRawAnswer(rawText)) {
-    setField(memory, "callbackTime", callbackTime || rawText, changedFields);
-    setField(memory, "callbackRequested", true, changedFields);
+  if (assistantAskedCallbackTime && shouldStoreRawAnswer(questionRawText)) {
+    if (callbackTime) {
+      setField(memory, "callbackTime", callbackTime, changedFields);
+      setField(memory, "callbackRequested", true, changedFields);
+    } else {
+      pushNote(memory, `Unclear callback time: ${questionRawText}`, changedFields);
+    }
   }
 
-  if (assistantAskedCallbackGeneral && shouldStoreRawAnswer(rawText)) {
+  if (assistantAskedCallbackGeneral && shouldStoreRawAnswer(questionRawText)) {
     if (!callbackDate && !callbackTime) {
-      pushNote(memory, `Callback details: ${rawText}`, changedFields);
+      pushNote(memory, `Callback details: ${questionRawText}`, changedFields);
     }
 
     setField(memory, "callbackRequested", true, changedFields);

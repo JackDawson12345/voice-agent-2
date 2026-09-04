@@ -23,6 +23,7 @@ const {
   getScriptedNextQuestion,
   hasCallbackSlot,
   hasSurveyAnswers,
+  inferQuestionKeyFromAssistantReply,
   normaliseCallProfile,
 } = require("./services/survey-script");
 
@@ -345,6 +346,9 @@ wss.on("connection", (ws) => {
   // This prevents tiny bits of background noise from cutting the AI off.
   let pendingBargeInTimer = null;
   let pendingBargeInTranscript = "";
+  let lastInterruptionTranscript = "";
+  let activePromptKey = null;
+  let activePromptText = "";
   const pendingCustomerSegments = [];
 
   function addTranscriptLine(role, content) {
@@ -434,6 +438,81 @@ wss.on("connection", (ws) => {
     }
 
     return normaliseTranscriptText(`${combinedTranscript} ${fallback}`);
+  }
+
+  function isLowInformationTranscript(text) {
+    const cleanText = normaliseTranscriptText(text).toLowerCase();
+
+    if (!cleanText) {
+      return true;
+    }
+
+    return [
+      "it",
+      "it's",
+      "its",
+      "yes",
+      "yeah",
+      "yep",
+      "hello",
+      "hi",
+      "okay",
+      "ok",
+    ].includes(cleanText);
+  }
+
+  function mergeTranscriptCandidates(primaryText = "", secondaryText = "") {
+    const primary = normaliseTranscriptText(primaryText);
+    const secondary = normaliseTranscriptText(secondaryText);
+
+    if (!primary) {
+      return secondary;
+    }
+
+    if (!secondary) {
+      return primary;
+    }
+
+    const primaryLower = primary.toLowerCase();
+    const secondaryLower = secondary.toLowerCase();
+
+    if (
+      primaryLower === secondaryLower ||
+      primaryLower.includes(secondaryLower)
+    ) {
+      return primary;
+    }
+
+    if (secondaryLower.includes(primaryLower)) {
+      return secondary;
+    }
+
+    if (isLowInformationTranscript(primary) && !isLowInformationTranscript(secondary)) {
+      return secondary;
+    }
+
+    if (isLowInformationTranscript(secondary) && !isLowInformationTranscript(primary)) {
+      return primary;
+    }
+
+    return primary.length >= secondary.length ? primary : secondary;
+  }
+
+  function updateActivePrompt(reply, options = {}) {
+    if (options.preserveExisting) {
+      return;
+    }
+
+    const promptKey = inferQuestionKeyFromAssistantReply(reply);
+
+    if (promptKey) {
+      activePromptKey = promptKey;
+      activePromptText = String(reply || "");
+      return;
+    }
+
+    activePromptKey = null;
+    activePromptText = "";
   }
 
   function getCurrentCallProfile() {
@@ -893,6 +972,7 @@ wss.on("connection", (ws) => {
         markShouldStartSilenceTimer(introMarkName);
 
         sendAudioToTwilio(ws, currentStreamSid, introAudio, introMarkName);
+        updateActivePrompt(INTRO_MESSAGE);
 
         conversationHistory.push({
           role: "assistant",
@@ -963,6 +1043,7 @@ wss.on("connection", (ws) => {
     markShouldStartSilenceTimer(markName);
 
     sendAudioToTwilio(ws, currentStreamSid, screeningAudio, markName);
+    updateActivePrompt(screeningReply);
 
     conversationHistory.push({
       role: "assistant",
@@ -1043,6 +1124,7 @@ wss.on("connection", (ws) => {
     console.log("Leaving voicemail message:", voicemailMessage);
 
     addTranscriptLine("assistant", voicemailMessage);
+    updateActivePrompt(voicemailMessage);
 
     conversationHistory.push({
       role: "assistant",
@@ -1242,6 +1324,8 @@ wss.on("connection", (ws) => {
       {
         conversationHistory,
         callProfile: getCurrentCallProfile(),
+        promptKey: activePromptKey,
+        promptText: activePromptText,
       }
     );
 
@@ -1259,6 +1343,7 @@ wss.on("connection", (ws) => {
 
       console.log("AI replied:", doNotCallReply);
       addTranscriptLine("assistant", doNotCallReply);
+      updateActivePrompt(doNotCallReply);
 
       const doNotCallAudio = await textToSpeech(doNotCallReply);
       const markName = `ai-audio-${Date.now()}`;
@@ -1380,6 +1465,7 @@ wss.on("connection", (ws) => {
 
       console.log("AI replied:", aiReply);
       addTranscriptLine("assistant", aiReply);
+      updateActivePrompt(aiReply);
 
       console.log("TTS started");
 
@@ -1542,6 +1628,7 @@ wss.on("connection", (ws) => {
       console.log("Customer interrupted AI:", pendingBargeInTranscript);
 
       interruptionHappened = true;
+      lastInterruptionTranscript = pendingBargeInTranscript;
 
       // Invalidate current AI/TTS work.
       responseGenerationId++;
@@ -1621,7 +1708,12 @@ wss.on("connection", (ws) => {
           return;
         }
 
-        const finalTranscript = takePendingCustomerUtterance(cleanTranscript);
+        const finalTranscript = mergeTranscriptCandidates(
+          takePendingCustomerUtterance(cleanTranscript),
+          lastInterruptionTranscript
+        );
+
+        lastInterruptionTranscript = "";
 
         if (!finalTranscript) {
           return;
