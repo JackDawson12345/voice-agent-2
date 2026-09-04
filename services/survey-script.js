@@ -138,6 +138,16 @@ function callbackConsentQuestion({ companyName }) {
   return `As I mentioned earlier, I am calling on behalf of ${normaliseCompanyNameForSpeech(companyName)}. To thank you for taking part in the survey, one of our UK experts can call you back and provide a no cost basic listing on the largest directories in the UK to help give your business more visibility. Is that OK?`;
 }
 
+function buildIndustryConfirmationQuestion(industry) {
+  const cleanIndustry = cleanText(industry);
+
+  if (!cleanIndustry) {
+    return "I just wanted to check I got that correctly, what classification or industry does your business come under?";
+  }
+
+  return `I just wanted to check I got that correctly, was it ${cleanIndustry}?`;
+}
+
 function hasWebsiteBranchDetail(memory = {}) {
   if (memory.websiteStatus === "yes") {
     return Boolean(memory.websiteAge);
@@ -262,6 +272,13 @@ function inferQuestionKeyFromAssistantReply(reply = "") {
   }
 
   if (
+    lower.includes("i just wanted to check i got that correctly") &&
+    lower.includes("was it")
+  ) {
+    return "industry_confirmation";
+  }
+
+  if (
     lower.includes("to thank you for taking part in the survey") ||
     lower.includes("no cost basic listing")
   ) {
@@ -364,6 +381,10 @@ function getScriptedNextQuestion(
     return "Would you like to get enquiries or more enquiries online?";
   }
 
+  if (memory.pendingIndustry && !memory.industry) {
+    return buildIndustryConfirmationQuestion(memory.pendingIndustry);
+  }
+
   if (!memory.industry) {
     return "What classification or industry does your business come under?";
   }
@@ -442,6 +463,7 @@ module.exports = {
   buildBusinessVerificationQuestion,
   buildCallbackConfirmationMessage,
   buildFinancialAuthorityClarifier,
+  buildIndustryConfirmationQuestion,
   buildIntroMessage,
   callbackConsentQuestion,
   formatCallProfileForPrompt,

@@ -26,6 +26,7 @@ function createSessionMemory() {
     websiteInterestLevel: null,
     onlineEnquiryStatus: null,
     interestInMoreEnquiries: null,
+    pendingIndustry: null,
     industry: null,
     callbackConsent: null,
     callbackDate: null,
@@ -100,13 +101,13 @@ function hasAny(text, phrases) {
 }
 
 function isSimpleYes(text) {
-  return /^(?:yes|yeah|yep|yeh|sure|okay|ok|correct|that'?s right|that is right|that is correct|it is|fine|go ahead|please do|happy to)[.!?\s]*$/i.test(
+  return /^(?:yes|yeah|yep|yeh|sure|okay|ok|correct|that'?s right|that is right|that is correct|that'?s correct|i am|i'm|it is|that is|fine|go ahead|please do|happy to|absolutely|definitely|indeed)[.!?\s]*$/i.test(
     cleanValue(text)
   );
 }
 
 function isSimpleNo(text) {
-  return /^(?:no|nope|nah|not really|not at the moment|not now|rather not)[.!?\s]*$/i.test(
+  return /^(?:no|nope|nah|not really|not at the moment|not now|rather not|i am not|i'm not|it is not|it isn't|that is not right|that isn't right|incorrect)[.!?\s]*$/i.test(
     cleanValue(text)
   );
 }
@@ -267,9 +268,34 @@ function normaliseContactNameAnswer(text) {
 
 function normaliseIndustryAnswer(text) {
   return stripLeadingPhrase(text, [
+    /^(?:yes|yeah|yep|yeh|correct|right|okay|ok|no|nope|nah)[,.\s-]+/i,
     /^(?:it is|it's|we are|we're)[,.\s-]+/i,
+    /^(?:the industry is|our industry is|the classification is|our classification is|the business is|our business is)[,.\s-]+/i,
     /^(?:a|an)\s+/i,
   ]);
+}
+
+function normaliseIndustryCandidate(text) {
+  const candidate = normaliseIndustryAnswer(text);
+  const lower = compactText(candidate);
+  const blockedCandidates = new Set([
+    "that's",
+    "that is",
+    "this",
+    "it",
+    "there",
+    "here",
+  ]);
+
+  if (!candidate || isAffirmativeAnswer(lower) || isNegativeAnswer(lower)) {
+    return null;
+  }
+
+  if (blockedCandidates.has(lower)) {
+    return null;
+  }
+
+  return candidate;
 }
 
 function stripPresenceCheckPrefix(text) {
@@ -667,62 +693,16 @@ function isLowConfidenceIndustry(text) {
     "still here",
   ]);
 
-  const commonSingleWordIndustries = new Set([
-    "accounting",
-    "advertising",
-    "automotive",
-    "barber",
-    "beauty",
-    "builder",
-    "building",
-    "catering",
-    "childcare",
-    "cleaning",
-    "construction",
-    "dentistry",
-    "digital",
-    "electrical",
-    "electrician",
-    "fashion",
-    "fitness",
-    "florist",
-    "floristry",
-    "gardening",
-    "hairdressing",
-    "healthcare",
-    "hospitality",
-    "joinery",
-    "landscaping",
-    "legal",
-    "lettings",
-    "marketing",
-    "mechanic",
-    "photography",
-    "plumber",
-    "plumbing",
-    "printing",
-    "property",
-    "retail",
-    "roofing",
-    "security",
-    "tailoring",
-    "telecoms",
-    "telecommunications",
-    "transport",
-    "travel",
-    "wedding",
-  ]);
-
   if (blockedValues.has(lower)) {
     return true;
   }
 
   if (words.length === 1) {
-    if (commonSingleWordIndustries.has(lower)) {
-      return false;
+    if (lower.length <= 2) {
+      return true;
     }
 
-    return true;
+    return false;
   }
 
   return false;
@@ -787,6 +767,13 @@ function setField(memory, field, value, changedFields) {
 
   if (memory[field] !== cleanedValue) {
     memory[field] = cleanedValue;
+    changedFields.push(field);
+  }
+}
+
+function clearField(memory, field, changedFields) {
+  if (memory[field] !== null) {
+    memory[field] = null;
     changedFields.push(field);
   }
 }
@@ -1110,6 +1097,16 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
       "what type of business",
       "what industry are you in",
       "classification or industry",
+    ]
+  );
+
+  const assistantAskedIndustryConfirmation = promptMatches(
+    promptKey,
+    "industry_confirmation",
+    lastAssistantLower,
+    [
+      "i just wanted to check i got that correctly",
+      "was it",
     ]
   );
 
@@ -1541,21 +1538,40 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     }
   }
 
-  const inferredIndustry =
-    inferIndustryFromText(questionRawText) || inferIndustryFromText(memory.businessName);
-
   if (assistantAskedIndustry && shouldStoreRawAnswer(questionRawText)) {
-    const normalisedIndustry =
-      inferIndustryFromText(questionRawText) ||
-      normaliseIndustryAnswer(questionRawText);
+    const industryCandidate =
+      normaliseIndustryCandidate(questionRawText) || inferIndustryFromText(questionRawText);
 
-    if (normalisedIndustry && !isLowConfidenceIndustry(normalisedIndustry)) {
-      setField(memory, "industry", normalisedIndustry, changedFields);
+    if (industryCandidate && !isLowConfidenceIndustry(industryCandidate)) {
+      setField(memory, "pendingIndustry", industryCandidate, changedFields);
+      clearField(memory, "industry", changedFields);
     } else {
       pushNote(memory, `Unclear industry answer: ${questionRawText}`, changedFields);
     }
-  } else if (!memory.industry && inferredIndustry) {
-    setField(memory, "industry", inferredIndustry, changedFields);
+  }
+
+  if (assistantAskedIndustryConfirmation) {
+    const pendingIndustry = cleanValue(memory.pendingIndustry);
+    const correctedIndustry =
+      normaliseIndustryCandidate(questionRawText) || inferIndustryFromText(questionRawText);
+
+    if (isAffirmativeAnswer(questionRawText)) {
+      if (pendingIndustry) {
+        setField(memory, "industry", pendingIndustry, changedFields);
+      }
+
+      clearField(memory, "pendingIndustry", changedFields);
+    } else if (isNegativeAnswer(questionRawText)) {
+      clearField(memory, "industry", changedFields);
+      clearField(memory, "pendingIndustry", changedFields);
+
+      if (correctedIndustry && !isLowConfidenceIndustry(correctedIndustry)) {
+        setField(memory, "pendingIndustry", correctedIndustry, changedFields);
+      }
+    } else if (correctedIndustry && !isLowConfidenceIndustry(correctedIndustry)) {
+      setField(memory, "pendingIndustry", correctedIndustry, changedFields);
+      clearField(memory, "industry", changedFields);
+    }
   }
 
   const callbackDate = extractDateLikeText(questionRawText);
@@ -1677,6 +1693,7 @@ function formatSessionMemoryForPrompt(memory) {
     `Website interest level: ${formatValue(memory.websiteInterestLevel)}`,
     `Gets enquiries online: ${formatValue(memory.onlineEnquiryStatus)}`,
     `Interested in more enquiries: ${formatValue(memory.interestInMoreEnquiries)}`,
+    `Pending industry: ${formatValue(memory.pendingIndustry)}`,
     `Industry: ${formatValue(memory.industry)}`,
     `Callback consent: ${formatValue(memory.callbackConsent)}`,
     `Callback date: ${formatValue(memory.callbackDate)}`,
@@ -1710,6 +1727,7 @@ function formatSessionMemoryForLog(memory) {
     websiteInterestLevel: memory.websiteInterestLevel,
     onlineEnquiryStatus: memory.onlineEnquiryStatus,
     interestInMoreEnquiries: memory.interestInMoreEnquiries,
+    pendingIndustry: memory.pendingIndustry,
     industry: memory.industry,
     callbackConsent: memory.callbackConsent,
     callbackDate: memory.callbackDate,
