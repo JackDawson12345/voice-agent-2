@@ -24,6 +24,7 @@ const {
   hasCallbackSlot,
   hasSurveyAnswers,
   inferQuestionKeyFromAssistantReply,
+  isFinancialAuthorityPrompt,
   normaliseCallProfile,
   normaliseCompanyNameForSpeech,
 } = require("./services/survey-script");
@@ -63,7 +64,7 @@ const INTRO_MESSAGE =
   });
 
 const SILENCE_CHECK_MESSAGE =
-  process.env.SILENCE_CHECK_MESSAGE || "Hello, are you still there?";
+  process.env.SILENCE_CHECK_MESSAGE || "Hello, are you still on the line?";
 
 const INTRO_DELAY_MS = Number(process.env.INTRO_DELAY_MS || 700);
 const SILENCE_TIMEOUT_MS = Number(process.env.SILENCE_TIMEOUT_MS || 8000);
@@ -1255,13 +1256,7 @@ wss.on("connection", (ws) => {
   }
 
   function lastAssistantAskedFinancialAuthority() {
-    const lower = getLastAssistantReply().toLowerCase();
-
-    return (
-      lower.includes("authorised to make financial decisions") ||
-      lower.includes("authorized to make financial decisions") ||
-      lower.includes("make financial decisions on behalf of the business")
-    );
+    return isFinancialAuthorityPrompt(getLastAssistantReply());
   }
 
   function looksLikeFinancialDecisionClarification(text) {
@@ -1272,6 +1267,9 @@ wss.on("connection", (ws) => {
       lower.includes("what sort of financial decisions") ||
       lower.includes("what do you mean by financial decisions") ||
       lower.includes("which financial decisions") ||
+      /\b(?:depend|depends|depending)\b.*\bwhat\b.*\bdecision/.test(lower) ||
+      /\bwhat\b.*\bdecision/.test(lower) ||
+      /\bwhich\b.*\bdecision/.test(lower) ||
       lower === "what kind" ||
       lower === "what do you mean"
     );
@@ -1301,32 +1299,49 @@ wss.on("connection", (ws) => {
 
   function isLikelyPickupGreeting(text) {
     const lower = String(text || "").toLowerCase().trim();
+    const normalised = lower
+      .replace(/[.,!?]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const strippedLeadIn = normalised
+      .replace(/^(?:oh|ah|erm|um|yeah|yes)\b\s*/i, "")
+      .trim();
 
-    if (!lower || looksLikeCustomerQuestion(lower)) {
+    if (!normalised || looksLikeCustomerQuestion(normalised)) {
       return false;
     }
 
     if (
       /^(hi|hello|hey|good morning|good afternoon|good evening)(\b|[,.!])/.test(
-        lower
+        normalised
       )
     ) {
       return true;
     }
 
-    if (/^[a-z][a-z' -]{0,40}\s+(speaking|here)$/i.test(lower)) {
+    if (
+      /^[a-z][a-z' -]{0,40}\s+(speaking|calling|here)$/i.test(strippedLeadIn)
+    ) {
       return true;
     }
 
-    if (/^(this is|speaking)\s+[a-z][a-z' -]{0,40}$/i.test(lower)) {
+    if (/^(this is|speaking)\s+[a-z][a-z' -]{0,40}$/i.test(strippedLeadIn)) {
       return true;
     }
 
-    return /^[a-z][a-z' -]{1,40}$/i.test(lower) && lower.split(/\s+/).length <= 3;
+    return (
+      /^[a-z][a-z' -]{1,40}$/i.test(strippedLeadIn) &&
+      strippedLeadIn.split(/\s+/).length <= 3
+    );
   }
 
-  function buildWarmOwnerGreetingReply() {
-    return `Hello, thanks for taking the call. As I was saying, I am calling on behalf of ${SPOKEN_CLIENT_COMPANY_NAME} regarding online visibility for businesses. Are you the business owner?`;
+  function buildWarmOwnerGreetingReply(memory) {
+    const contactName = String(memory?.contactName || "").trim();
+    const greetingPrefix = contactName
+      ? `Hello ${contactName}, thanks for taking the call.`
+      : "Hello, thanks for taking the call.";
+
+    return `${greetingPrefix} As I was saying, I am calling on behalf of ${SPOKEN_CLIENT_COMPANY_NAME} regarding online visibility for businesses. Are you the business owner?`;
   }
 
   function getFastPathReply(memory, cleanTranscript) {
@@ -1365,7 +1380,7 @@ wss.on("connection", (ws) => {
       !hasPriorCustomerTurn() &&
       isLikelyPickupGreeting(cleanTranscript)
     ) {
-      return buildWarmOwnerGreetingReply();
+      return buildWarmOwnerGreetingReply(memory);
     }
 
     if (scriptedNextQuestion && !looksLikeCustomerQuestion(cleanTranscript)) {

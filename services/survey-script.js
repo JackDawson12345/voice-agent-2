@@ -69,6 +69,23 @@ function buildFinancialAuthorityClarifier() {
   return "Can you make financial decisions on advertisement or website?";
 }
 
+function isFinancialAuthorityPrompt(text = "") {
+  const lower = cleanText(text).toLowerCase();
+
+  if (!lower) {
+    return false;
+  }
+
+  return (
+    lower.includes("authorised to make financial decisions") ||
+    lower.includes("authorized to make financial decisions") ||
+    lower.includes("make financial decisions on behalf of the business") ||
+    lower.includes("financial decisions on advertisement or website") ||
+    lower.includes("financial decisions on advertising or website") ||
+    lower.includes("make those decisions on behalf of the business")
+  );
+}
+
 function buildAddressVerificationQuestion(customer = {}) {
   const address = formatCustomerAddress(customer);
   const postcode = cleanText(customer.postcode);
@@ -190,11 +207,7 @@ function inferQuestionKeyFromAssistantReply(reply = "") {
     return "owner_status";
   }
 
-  if (
-    lower.includes("authorised to make financial decisions") ||
-    lower.includes("authorized to make financial decisions") ||
-    lower.includes("make financial decisions on behalf of the business")
-  ) {
+  if (isFinancialAuthorityPrompt(lower)) {
     return "financial_authority";
   }
 
@@ -429,6 +442,7 @@ module.exports = {
   hasSurveyAnswers,
   hasWebsiteBranchDetail,
   inferQuestionKeyFromAssistantReply,
+  isFinancialAuthorityPrompt,
   normaliseCallProfile,
   normaliseCompanyNameForSpeech,
 };

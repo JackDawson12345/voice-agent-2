@@ -1,6 +1,9 @@
 // services/session-memory.js
 
-const { formatCustomerAddress } = require("./survey-script");
+const {
+  formatCustomerAddress,
+  isFinancialAuthorityPrompt,
+} = require("./survey-script");
 
 function createSessionMemory() {
   return {
@@ -272,7 +275,15 @@ function normaliseIndustryAnswer(text) {
 function stripPresenceCheckPrefix(text) {
   let value = cleanValue(text);
 
-  value = value.replace(/^(?:yes|yeah|yep|yeh|hello|hi|okay|ok)[,.\s-]*/i, "");
+  const affirmativePresenceMatch = value.match(
+    /^(yes|yeah|yep|yeh|okay|ok)[,.\s-]+(?:(?:i am|i'm|we are|we're)\s+)?(?:still here|still there|still on the line|here on the line|on the line)\b/i
+  );
+
+  if (affirmativePresenceMatch) {
+    return cleanValue(affirmativePresenceMatch[1]);
+  }
+
+  value = value.replace(/^(?:hello|hi)[,.\s-]*/i, "");
   value = value.replace(
     /^(?:(?:i am|i'm|we are|we're)\s+)?(?:still here|still there|still on the line|here on the line|on the line)\b[,.\s-]*/i,
     ""
@@ -833,8 +844,14 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
       "authorised to make financial decisions",
       "authorized to make financial decisions",
       "make financial decisions on behalf of the business",
+      "financial decisions on advertisement or website",
+      "financial decisions on advertising or website",
+      "make those decisions on behalf of the business",
     ]
   );
+
+  const assistantAskedFinancialAuthorityByPrompt =
+    assistantAskedFinancialAuthority || isFinancialAuthorityPrompt(lastAssistantLower);
 
   const assistantAskedAddressConfirmation = promptMatches(
     promptKey,
@@ -1176,7 +1193,7 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     }
   }
 
-  if (assistantAskedFinancialAuthority) {
+  if (assistantAskedFinancialAuthorityByPrompt) {
     if (
       isAffirmativeAnswer(questionRawText) ||
       hasAny(questionLower, [
