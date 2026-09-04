@@ -10,6 +10,16 @@ function startsWithAny(text, prefixes) {
   return prefixes.some((prefix) => text.startsWith(prefix));
 }
 
+function normaliseCompanyNameForSpeech(name) {
+  const cleanName = cleanText(name);
+
+  if (!cleanName) {
+    return cleanName;
+  }
+
+  return cleanName.replace(/\b118\b/gi, "1 1 8");
+}
+
 function normaliseCallProfile(raw = {}) {
   const customer = raw.customer || {};
   const survey = raw.survey || {};
@@ -52,7 +62,7 @@ function formatCustomerAddress(customer = {}) {
 }
 
 function buildIntroMessage({ agentName, companyName }) {
-  return `Hi there, my name is ${agentName} and I am calling you on behalf of ${companyName}, the leading directory for searches on Google, Bing and Yahoo. We are just carrying out a short survey regarding online visibility for businesses. So are you the business owner?`;
+  return `Hi there, my name is ${agentName} and I am calling you on behalf of ${normaliseCompanyNameForSpeech(companyName)}, the leading directory for searches on Google, Bing and Yahoo. We are just carrying out a short survey regarding online visibility for businesses. So are you the business owner?`;
 }
 
 function buildFinancialAuthorityClarifier() {
@@ -98,7 +108,7 @@ function buildBusinessVerificationQuestion(customer = {}, fallbackPhoneNumber = 
 }
 
 function callbackConsentQuestion({ companyName }) {
-  return `As I mentioned earlier, I am calling on behalf of ${companyName}. To thank you for taking part in the survey, one of our UK experts can call you back and provide a no cost basic listing on the largest directories in the UK to help give your business more visibility. Is that OK?`;
+  return `As I mentioned earlier, I am calling on behalf of ${normaliseCompanyNameForSpeech(companyName)}. To thank you for taking part in the survey, one of our UK experts can call you back and provide a no cost basic listing on the largest directories in the UK to help give your business more visibility. Is that OK?`;
 }
 
 function hasWebsiteBranchDetail(memory = {}) {
@@ -420,4 +430,5 @@ module.exports = {
   hasWebsiteBranchDetail,
   inferQuestionKeyFromAssistantReply,
   normaliseCallProfile,
+  normaliseCompanyNameForSpeech,
 };

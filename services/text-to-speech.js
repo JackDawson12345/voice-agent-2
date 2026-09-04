@@ -50,6 +50,7 @@ function formatPostcodeForSpeech(value) {
 
 function prepareTextForSpeech(text) {
   return String(text || "")
+    .replace(/\b118(?=\s+online\b)/gi, "1 1 8")
     .replace(
       /\b([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})\b/gi,
       (match) => formatPostcodeForSpeech(match)

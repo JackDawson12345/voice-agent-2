@@ -25,6 +25,7 @@ const {
   hasSurveyAnswers,
   inferQuestionKeyFromAssistantReply,
   normaliseCallProfile,
+  normaliseCompanyNameForSpeech,
 } = require("./services/survey-script");
 
 const {
@@ -50,12 +51,15 @@ app.use(express.urlencoded({ extended: false }));
 
 const AGENT_NAME = process.env.AGENT_NAME || "Lily";
 const CLIENT_COMPANY_NAME = process.env.CLIENT_COMPANY_NAME || "118 Online";
+const SPOKEN_CLIENT_COMPANY_NAME = normaliseCompanyNameForSpeech(
+  CLIENT_COMPANY_NAME
+);
 
 const INTRO_MESSAGE =
   process.env.INTRO_MESSAGE ||
   buildIntroMessage({
     agentName: AGENT_NAME,
-    companyName: CLIENT_COMPANY_NAME,
+    companyName: SPOKEN_CLIENT_COMPANY_NAME,
   });
 
 const SILENCE_CHECK_MESSAGE =
@@ -71,15 +75,16 @@ const BARGE_IN_DEBOUNCE_MS = Number(process.env.BARGE_IN_DEBOUNCE_MS || 250);
 // which happens if the customer barges in and the buffer gets cleared -
 // this makes sure the call still ends instead of hanging open indefinitely.
 const HANGUP_FALLBACK_DELAY_MS = Number(process.env.HANGUP_FALLBACK_DELAY_MS || 6000);
+const FINAL_HANGUP_GRACE_MS = Number(process.env.FINAL_HANGUP_GRACE_MS || 1200);
 
 // Live transfer removed. Callback flow only.
 const ENABLE_CALLBACK_FLOW = true;
 const CALL_SCREENING_MESSAGE =
   process.env.CALL_SCREENING_MESSAGE ||
-  `Hi, my name is ${AGENT_NAME} calling on behalf of ${CLIENT_COMPANY_NAME} regarding the business and online visibility.`;
+  `Hi, my name is ${AGENT_NAME} calling on behalf of ${SPOKEN_CLIENT_COMPANY_NAME} regarding the business and online visibility.`;
 const VOICEMAIL_MESSAGE =
   process.env.VOICEMAIL_MESSAGE ||
-  `Hi, my name is ${AGENT_NAME} calling on behalf of ${CLIENT_COMPANY_NAME} regarding your business and online visibility. Please give us a call back when convenient. Thank you.`;
+  `Hi, my name is ${AGENT_NAME} calling on behalf of ${SPOKEN_CLIENT_COMPANY_NAME} regarding your business and online visibility. Please give us a call back when convenient. Thank you.`;
 
 function xmlEscape(value) {
   return String(value || "")
@@ -339,6 +344,7 @@ wss.on("connection", (ws) => {
 
   let pendingHangupAfterMark = null;
   let pendingHangupFallbackTimer = null;
+  let pendingFinalHangupTimer = null;
   let callEndReason = null;
   let callIsEnding = false;
 
@@ -723,16 +729,46 @@ wss.on("connection", (ws) => {
     }
   }
 
+  function clearPendingFinalHangupTimer() {
+    if (pendingFinalHangupTimer) {
+      clearTimeout(pendingFinalHangupTimer);
+      pendingFinalHangupTimer = null;
+    }
+  }
+
+  function estimateMulawPlaybackDurationMs(audioBuffer) {
+    if (!audioBuffer || !audioBuffer.length) {
+      return 0;
+    }
+
+    return Math.ceil(audioBuffer.length / 8);
+  }
+
+  function scheduleFinalHangup(reason) {
+    clearPendingFinalHangupTimer();
+
+    pendingFinalHangupTimer = setTimeout(() => {
+      pendingFinalHangupTimer = null;
+      endCallNow(reason);
+    }, FINAL_HANGUP_GRACE_MS);
+  }
+
   // Registers the mark Twilio should report back once a final message has
   // finished playing, so the call can be ended right after. If the customer
   // barges in on that audio, Twilio clears its buffer and will never send
   // that mark event back - so this also arms a fallback timer that ends the
   // call anyway if the mark never arrives.
-  function scheduleHangupAfterMark(markName, reason) {
+  function scheduleHangupAfterMark(markName, reason, playbackDurationMs = 0) {
     pendingHangupAfterMark = markName;
     callEndReason = reason;
 
     clearPendingHangupFallbackTimer();
+    clearPendingFinalHangupTimer();
+
+    const fallbackDelayMs = Math.max(
+      HANGUP_FALLBACK_DELAY_MS,
+      Number(playbackDurationMs || 0) + FINAL_HANGUP_GRACE_MS + 1200
+    );
 
     pendingHangupFallbackTimer = setTimeout(() => {
       pendingHangupFallbackTimer = null;
@@ -748,8 +784,8 @@ wss.on("connection", (ws) => {
       console.log("Hangup fallback triggered because Twilio mark was not received:", markName);
 
       pendingHangupAfterMark = null;
-      endCallNow(reason);
-    }, HANGUP_FALLBACK_DELAY_MS);
+      scheduleFinalHangup(reason);
+    }, fallbackDelayMs);
   }
 
   function cancelActiveAudioTracking() {
@@ -911,6 +947,7 @@ wss.on("connection", (ws) => {
       clearPendingBargeInTimer();
       clearPendingVoicemailTimer();
       clearPendingHangupFallbackTimer();
+      clearPendingFinalHangupTimer();
 
       await endOutboundCall(currentCallSid);
 
@@ -1154,7 +1191,11 @@ wss.on("connection", (ws) => {
 
         activeAudioMark = markName;
         aiIsSpeaking = true;
-        scheduleHangupAfterMark(markName, "Voicemail message finished playing");
+        scheduleHangupAfterMark(
+          markName,
+          "Voicemail message finished playing",
+          estimateMulawPlaybackDurationMs(voicemailAudio)
+        );
 
         console.log("Call will end after voicemail message:", markName);
 
@@ -1252,6 +1293,42 @@ wss.on("connection", (ws) => {
     );
   }
 
+  function hasPriorCustomerTurn() {
+    return conversationHistory.some(
+      (message) => message && message.role === "user" && message.content
+    );
+  }
+
+  function isLikelyPickupGreeting(text) {
+    const lower = String(text || "").toLowerCase().trim();
+
+    if (!lower || looksLikeCustomerQuestion(lower)) {
+      return false;
+    }
+
+    if (
+      /^(hi|hello|hey|good morning|good afternoon|good evening)(\b|[,.!])/.test(
+        lower
+      )
+    ) {
+      return true;
+    }
+
+    if (/^[a-z][a-z' -]{0,40}\s+(speaking|here)$/i.test(lower)) {
+      return true;
+    }
+
+    if (/^(this is|speaking)\s+[a-z][a-z' -]{0,40}$/i.test(lower)) {
+      return true;
+    }
+
+    return /^[a-z][a-z' -]{1,40}$/i.test(lower) && lower.split(/\s+/).length <= 3;
+  }
+
+  function buildWarmOwnerGreetingReply() {
+    return `Hello, thanks for taking the call. As I was saying, I am calling on behalf of ${SPOKEN_CLIENT_COMPANY_NAME} regarding online visibility for businesses. Are you the business owner?`;
+  }
+
   function getFastPathReply(memory, cleanTranscript) {
     if (memory.wrongNumber || memory.correctBusinessConfirmed === "no") {
       return "Thanks for letting me know. Sorry for the disturbance. Have a great day.";
@@ -1280,8 +1357,16 @@ wss.on("connection", (ws) => {
     const scriptedNextQuestion = getScriptedNextQuestion(
       memory,
       getCurrentCallProfile(),
-      { companyName: CLIENT_COMPANY_NAME }
+      { companyName: SPOKEN_CLIENT_COMPANY_NAME }
     );
+
+    if (
+      scriptedNextQuestion === "So are you the business owner?" &&
+      !hasPriorCustomerTurn() &&
+      isLikelyPickupGreeting(cleanTranscript)
+    ) {
+      return buildWarmOwnerGreetingReply();
+    }
 
     if (scriptedNextQuestion && !looksLikeCustomerQuestion(cleanTranscript)) {
       return scriptedNextQuestion;
@@ -1350,7 +1435,11 @@ wss.on("connection", (ws) => {
 
       activeAudioMark = markName;
       aiIsSpeaking = true;
-      scheduleHangupAfterMark(markName, "Do-not-call message finished playing");
+      scheduleHangupAfterMark(
+        markName,
+        "Do-not-call message finished playing",
+        estimateMulawPlaybackDurationMs(doNotCallAudio)
+      );
 
       console.log("Call will end after do-not-call message:", markName);
 
@@ -1446,7 +1535,7 @@ wss.on("connection", (ws) => {
         );
 
         aiReply = callbackConsentQuestion({
-          companyName: CLIENT_COMPANY_NAME,
+          companyName: SPOKEN_CLIENT_COMPANY_NAME,
         });
       }
 
@@ -1501,7 +1590,11 @@ wss.on("connection", (ws) => {
           ? "Callback arranged"
           : "Final AI message finished playing";
 
-        scheduleHangupAfterMark(markName, hangupReason);
+        scheduleHangupAfterMark(
+          markName,
+          hangupReason,
+          estimateMulawPlaybackDurationMs(aiAudio)
+        );
         console.log("Call will end after AI finishes speaking:", markName);
       } else {
         markShouldStartSilenceTimer(markName);
@@ -1794,8 +1887,9 @@ wss.on("connection", (ws) => {
         if (finishedMarkName && finishedMarkName === pendingHangupAfterMark) {
           pendingHangupAfterMark = null;
           clearPendingHangupFallbackTimer();
-
-          endCallNow(callEndReason || "Final AI message finished playing");
+          scheduleFinalHangup(
+            callEndReason || "Final AI message finished playing"
+          );
 
           return;
         }
@@ -1819,6 +1913,7 @@ wss.on("connection", (ws) => {
         clearPendingBargeInTimer();
         clearPendingVoicemailTimer();
         clearPendingHangupFallbackTimer();
+        clearPendingFinalHangupTimer();
         speechToText.close();
 
         console.log("Final session memory:", formatSessionMemoryForLog(sessionMemory));
@@ -1844,6 +1939,7 @@ wss.on("connection", (ws) => {
     clearPendingBargeInTimer();
     clearPendingVoicemailTimer();
     clearPendingHangupFallbackTimer();
+    clearPendingFinalHangupTimer();
     speechToText.close();
 
     console.log("Twilio media stream disconnected", {
@@ -1861,6 +1957,7 @@ wss.on("connection", (ws) => {
     clearPendingBargeInTimer();
     clearPendingVoicemailTimer();
     clearPendingHangupFallbackTimer();
+    clearPendingFinalHangupTimer();
     speechToText.close();
 
     console.error("WebSocket error:", error.message);

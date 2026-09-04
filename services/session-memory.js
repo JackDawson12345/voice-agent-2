@@ -119,7 +119,7 @@ function isAffirmativeAnswer(text) {
     return true;
   }
 
-  return /\b(yes|yeah|yep|yeh|sure|okay|ok|correct|that'?s right|that is right|that is correct|go ahead|please do|happy to|i do|we do|i am|we are|i have|we have|it is)\b/i.test(
+  return /\b(yes|yeah|yep|yeh|sure|okay|ok|correct|that'?s right|that is right|that is correct|go ahead|please do|happy to|i do|we do|i have|we have|it is)\b/i.test(
     lower
   );
 }
@@ -375,8 +375,8 @@ function extractDuration(text) {
 function extractDateLikeText(text) {
   return (
     extractAfterPatterns(text, [
-      /\b((?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)(?:\s+(?:morning|afternoon|evening))?)\b/i,
       /\b((?:next|this)\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|week))\b/i,
+      /\b((?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)(?:\s+(?:morning|afternoon|evening))?)\b/i,
       /\b(\d{1,2}(?:st|nd|rd|th)?\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?))\b/i,
       /\b((?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?)\b/i,
       /\b(\d{1,2}[\/-]\d{1,2}(?:[\/-]\d{2,4})?)\b/i,
@@ -385,18 +385,24 @@ function extractDateLikeText(text) {
 }
 
 function extractTimeLikeText(text) {
+  const numberPattern =
+    "(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\\d{1,2})";
+
   return (
     extractAfterPatterns(text, [
       /\b(after lunchtime|after lunch|before lunchtime|before lunch|around lunchtime|around lunch|late morning|early morning|early afternoon|late afternoon)\b/i,
-      /\b(any time after\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b/i,
-      /\b(any time before\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b/i,
-      /\b(between\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s+and\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b/i,
-      /\b(from\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s+(?:to|until)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b/i,
+      new RegExp(`\\b(any time after\\s+${numberPattern}(?::\\d{2})?\\s*(?:am|pm)?)\\b`, "i"),
+      new RegExp(`\\b(any time before\\s+${numberPattern}(?::\\d{2})?\\s*(?:am|pm)?)\\b`, "i"),
+      new RegExp(`\\b(between\\s+${numberPattern}(?::\\d{2})?\\s*(?:am|pm)?\\s+and\\s+${numberPattern}(?::\\d{2})?\\s*(?:am|pm)?)\\b`, "i"),
+      new RegExp(`\\b(from\\s+${numberPattern}(?::\\d{2})?\\s*(?:am|pm)?\\s+(?:to|until)\\s+${numberPattern}(?::\\d{2})?\\s*(?:am|pm)?)\\b`, "i"),
+      new RegExp(`\\b((?:about|around)\\s+(?:half\\s+past\\s+${numberPattern}|half\\s+${numberPattern}|quarter\\s+(?:past|to)\\s+${numberPattern}|${numberPattern}\\s*o'?clock|${numberPattern}(?::\\d{2})?\\s*(?:am|pm)?))\\b`, "i"),
+      new RegExp(`\\b((?:half\\s+past\\s+${numberPattern}|half\\s+${numberPattern}))\\b`, "i"),
+      new RegExp(`\\b((?:quarter\\s+(?:past|to)\\s+${numberPattern}))\\b`, "i"),
+      new RegExp(`\\b(${numberPattern}\\s*o'?clock)\\b`, "i"),
+      new RegExp(`\\b(${numberPattern}(?::\\d{2})?\\s*(?:am|pm))\\b`, "i"),
       /\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b/i,
-      /\b(\d{1,2}\s*o'?clock)\b/i,
       /\b((?:morning|afternoon|evening|lunchtime))\b/i,
-      /\b(half\s+past\s+\d{1,2})\b/i,
-      /\b(quarter\s+(?:past|to)\s+\d{1,2})\b/i,
+      new RegExp(`\\b(${numberPattern}:\\d{2})\\b`, "i"),
     ]) || null
   );
 }
@@ -564,7 +570,10 @@ function isLowConfidenceIndustry(text) {
 
 function normaliseCallbackTimeAnswer(text) {
   const candidate = cleanValue(text);
-  const lower = compactText(candidate);
+  const lower = compactText(candidate).replace(
+    /^(?:about|around|at about|at around|roughly|maybe|probably|say)\s+/,
+    ""
+  );
 
   if (!lower) {
     return null;
@@ -583,16 +592,27 @@ function normaliseCallbackTimeAnswer(text) {
     return normalisedMappings.get(lower);
   }
 
-  const extracted = extractTimeLikeText(candidate);
+  if (/^half\s+\w+$/i.test(lower)) {
+    return lower.replace(/^half\s+/, "half past ");
+  }
+
+  const extracted = extractTimeLikeText(lower);
 
   if (!extracted) {
     return null;
   }
 
-  const extractedLower = compactText(extracted);
+  const extractedLower = compactText(extracted).replace(
+    /^(?:about|around)\s+/,
+    ""
+  );
 
   if (normalisedMappings.has(extractedLower)) {
     return normalisedMappings.get(extractedLower);
+  }
+
+  if (/^half\s+\w+$/i.test(extractedLower)) {
+    return extractedLower.replace(/^half\s+/, "half past ");
   }
 
   return cleanValue(extractedLower);

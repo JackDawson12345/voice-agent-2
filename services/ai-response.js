@@ -5,6 +5,7 @@ const { formatSessionMemoryForPrompt } = require("./session-memory");
 const {
   formatCallProfileForPrompt,
   getNextStepInstruction,
+  normaliseCompanyNameForSpeech,
 } = require("./survey-script");
 
 const openai = new OpenAI({
@@ -14,8 +15,11 @@ const openai = new OpenAI({
 const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const AGENT_NAME = process.env.AGENT_NAME || "Lily";
 const CLIENT_COMPANY_NAME = process.env.CLIENT_COMPANY_NAME || "118 Online";
+const SPOKEN_CLIENT_COMPANY_NAME = normaliseCompanyNameForSpeech(
+  CLIENT_COMPANY_NAME
+);
 
-const SYSTEM_PROMPT = `You are ${AGENT_NAME}, a professional B2B survey caller calling businesses on behalf of ${CLIENT_COMPANY_NAME}.
+const SYSTEM_PROMPT = `You are ${AGENT_NAME}, a professional B2B survey caller calling businesses on behalf of ${SPOKEN_CLIENT_COMPANY_NAME}.
 
 Your only purpose is to:
 1. Ask the short online visibility survey in the required order.
@@ -33,13 +37,13 @@ Tone:
 - Be respectful of the person's time.
 - Do not pressure the customer.
 
-Call flow:
-- Start from this opening: "Hi there, my name is ${AGENT_NAME} and I am calling you on behalf of ${CLIENT_COMPANY_NAME}, the leading directory for searches on Google, Bing and Yahoo. We are just carrying out a short survey regarding online visibility for businesses. So are you the business owner?"
+ Call flow:
+- Start from this opening: "Hi there, my name is ${AGENT_NAME} and I am calling you on behalf of ${SPOKEN_CLIENT_COMPANY_NAME}, the leading directory for searches on Google, Bing and Yahoo. We are just carrying out a short survey regarding online visibility for businesses. So are you the business owner?"
 - Follow the survey order exactly unless the customer interrupts with a question.
 - Ask one question at a time.
 - Stay close to the script wording, but sound natural.
 - Use the Rails-provided business details for verification when asked.
-- If the customer asks what the call is about, briefly say you are carrying out a short survey regarding online visibility for businesses on behalf of ${CLIENT_COMPANY_NAME}, then return to the next step.
+- If the customer asks what the call is about, briefly say you are carrying out a short survey regarding online visibility for businesses on behalf of ${SPOKEN_CLIENT_COMPANY_NAME}, then return to the next step.
 - If they ask what kind of financial decisions, say: "Can you make financial decisions on advertisement or website?" and then continue.
 - Do not offer a live transfer. Arrange a callback instead.
 - If they are busy, ask when would be a better time for a callback.
@@ -68,7 +72,7 @@ async function getAIResponse({
     : "No session memory available.";
   const callProfileSummary = formatCallProfileForPrompt(callProfile);
   const nextStepInstruction = getNextStepInstruction(sessionMemory, callProfile, {
-    companyName: CLIENT_COMPANY_NAME,
+    companyName: SPOKEN_CLIENT_COMPANY_NAME,
   });
 
   const input = [
