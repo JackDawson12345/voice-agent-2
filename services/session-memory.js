@@ -1,13 +1,20 @@
 // services/session-memory.js
 
+const { formatCustomerAddress } = require("./survey-script");
+
 function createSessionMemory() {
   return {
     contactName: null,
+    contactTitle: null,
     correctBusinessConfirmed: null,
+    businessDetailsConfirmed: null,
+    addressConfirmed: null,
     businessName: null,
     businessAddress: null,
     postcode: null,
+    isBusinessOwner: null,
     isDecisionMaker: null,
+    authorisedDecisionMaker: null,
     decisionMakerName: null,
     decisionMakerRole: null,
     phoneNumber: null,
@@ -17,6 +24,7 @@ function createSessionMemory() {
     onlineEnquiryStatus: null,
     interestInMoreEnquiries: null,
     industry: null,
+    callbackConsent: null,
     callbackDate: null,
     callbackTime: null,
     callbackRequested: null,
@@ -200,6 +208,13 @@ function normaliseBusinessAddressAnswer(text) {
   ]);
 }
 
+function normaliseContactNameAnswer(text) {
+  return stripLeadingPhrase(text, [
+    /^(?:you can call me|call me|it's|it is|this is|i am|i'm)[,.\s-]+/i,
+    /^(?:mr|mrs|ms|miss|dr)\.?\s+/i,
+  ]);
+}
+
 function normaliseIndustryAnswer(text) {
   return stripLeadingPhrase(text, [
     /^(?:it is|it's|we are|we're)[,.\s-]+/i,
@@ -256,6 +271,35 @@ function extractRole(text) {
       /(?:role is|their role is)\s+(.{2,80})$/i,
     ]) || null
   );
+}
+
+function extractPhoneNumber(text) {
+  const digits = String(text || "").replace(/[^\d+]/g, "");
+
+  if (digits.length >= 7) {
+    return digits;
+  }
+
+  return null;
+}
+
+function normaliseHonorific(value) {
+  const lowered = cleanValue(value).toLowerCase().replace(/\./g, "");
+  const mappings = {
+    mr: "Mr",
+    mrs: "Mrs",
+    ms: "Ms",
+    miss: "Miss",
+    dr: "Dr",
+  };
+
+  return mappings[lowered] || null;
+}
+
+function extractHonorific(text) {
+  const match = String(text || "").match(/\b(mr|mrs|ms|miss|dr)\b\.?/i);
+
+  return match ? normaliseHonorific(match[1]) : null;
 }
 
 function extractDuration(text) {
@@ -394,6 +438,15 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   const lower = rawText.toLowerCase();
   const lastAssistant = getLastAssistantMessage(context.conversationHistory || []);
   const lastAssistantLower = lastAssistant.toLowerCase();
+  const callProfile = context.callProfile || {};
+  const callProfileCustomer = callProfile.customer || {};
+  const knownBusinessAddressLine = cleanValue(callProfileCustomer.address);
+  const knownBusinessAddress = formatCustomerAddress(callProfileCustomer);
+  const knownPostcode = cleanValue(callProfileCustomer.postcode);
+  const knownBusinessName = cleanValue(callProfileCustomer.businessName);
+  const knownBusinessPhone = cleanValue(
+    callProfileCustomer.phoneNumber || callProfile.to
+  );
 
   if (!rawText) {
     return { changedFields, memory };
@@ -466,6 +519,9 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     "who am i speaking with",
     "who am i speaking to",
     "who am i speaking with please",
+    "how should i address you",
+    "how can i address you",
+    "what should i call you",
   ]);
 
   const assistantAskedBusinessName = hasAny(lastAssistantLower, [
@@ -488,10 +544,31 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   ]);
 
   const assistantAskedDecisionMaker = hasAny(lastAssistantLower, [
-    "business owner",
     "looks after decisions around advertising",
     "websites or online marketing",
     "responsible for advertising",
+  ]);
+
+  const assistantAskedOwnerStatus = hasAny(lastAssistantLower, [
+    "are you the business owner",
+  ]);
+
+  const assistantAskedFinancialAuthority = hasAny(lastAssistantLower, [
+    "authorised to make financial decisions",
+    "authorized to make financial decisions",
+    "make financial decisions on behalf of the business",
+  ]);
+
+  const assistantAskedAddressConfirmation = hasAny(lastAssistantLower, [
+    "confirm that your address is",
+    "confirm your address is",
+    "confirm that the postcode is",
+  ]);
+
+  const assistantAskedBusinessDetailsConfirmation = hasAny(lastAssistantLower, [
+    "business name as",
+    "business number as",
+    "business number",
   ]);
 
   const assistantAskedDecisionMakerName = hasAny(lastAssistantLower, [
@@ -509,6 +586,7 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   const assistantAskedWebsiteStatus = hasAny(lastAssistantLower, [
     "currently have a website",
     "have a website for your business",
+    "do you currently have a website",
   ]);
 
   const assistantAskedWebsiteAge = hasAny(lastAssistantLower, [
@@ -519,35 +597,48 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   const assistantAskedWebsiteInterest = hasAny(lastAssistantLower, [
     "considered getting a website",
     "help customers find your business online",
+    "considered getting a website for your business",
   ]);
 
   const assistantAskedOnlineEnquiries = hasAny(lastAssistantLower, [
     "receive enquiries",
     "online searches",
     "through online searches or your website",
+    "get enquiries online from new customers",
   ]);
 
   const assistantAskedMoreEnquiries = hasAny(lastAssistantLower, [
     "interested in receiving more enquiries",
     "more enquiries from customers searching online",
+    "like to get enquiries or more enquiries online",
   ]);
 
   const assistantAskedIndustry = hasAny(lastAssistantLower, [
     "type of business or industry",
     "what type of business",
     "what industry are you in",
+    "classification or industry",
+  ]);
+
+  const assistantAskedCallbackConsent = hasAny(lastAssistantLower, [
+    "to thank you for taking part in the survey",
+    "no cost basic listing",
+    "is that ok",
+    "is that okay",
   ]);
 
   const assistantAskedCallbackDay = hasAny(lastAssistantLower, [
     "what day would suit you best",
     "what day would be better",
     "what day would suit them best",
+    "what day would suit best",
   ]);
 
   const assistantAskedCallbackTime = hasAny(lastAssistantLower, [
     "what time would suit you best",
     "what time would suit them best",
     "what time works best",
+    "what time would suit best",
   ]);
 
   const assistantAskedCallbackGeneral = hasAny(lastAssistantLower, [
@@ -559,11 +650,21 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
 
   const contactName =
     extractPersonName(speechText) || extractPersonName(rawText) || null;
+  const contactTitle = extractHonorific(rawText);
 
   if (contactName && (!memory.contactName || assistantAskedContactName)) {
     setField(memory, "contactName", contactName, changedFields);
   } else if (assistantAskedContactName && shouldStoreRawAnswer(rawText)) {
-    setField(memory, "contactName", rawText, changedFields);
+    setField(
+      memory,
+      "contactName",
+      normaliseContactNameAnswer(rawText) || rawText,
+      changedFields
+    );
+  }
+
+  if (contactTitle && (!memory.contactTitle || assistantAskedContactName)) {
+    setField(memory, "contactTitle", contactTitle, changedFields);
   }
 
   const businessName =
@@ -583,6 +684,42 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     setField(memory, "postcode", postcode, changedFields);
   }
 
+  if (assistantAskedAddressConfirmation) {
+    if (isAffirmativeAnswer(rawText)) {
+      setField(memory, "addressConfirmed", "yes", changedFields);
+
+      if (knownBusinessAddressLine || knownBusinessAddress) {
+        setField(
+          memory,
+          "businessAddress",
+          knownBusinessAddressLine || knownBusinessAddress,
+          changedFields
+        );
+      }
+
+      if (knownPostcode) {
+        setField(memory, "postcode", knownPostcode, changedFields);
+      }
+    } else if (isNegativeAnswer(rawText) || shouldStoreRawAnswer(rawText)) {
+      setField(memory, "addressConfirmed", "no", changedFields);
+
+      if (postcode) {
+        setField(memory, "postcode", postcode, changedFields);
+      }
+
+      if (shouldStoreRawAnswer(rawText) && !isNegativeAnswer(rawText)) {
+        setField(
+          memory,
+          "businessAddress",
+          normaliseBusinessAddressAnswer(rawText),
+          changedFields
+        );
+      } else if (shouldStoreRawAnswer(rawText)) {
+        pushNote(memory, `Address correction: ${rawText}`, changedFields);
+      }
+    }
+  }
+
   if (
     assistantAskedBusinessAddress &&
     shouldStoreRawAnswer(rawText) &&
@@ -599,6 +736,95 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
 
   if (assistantAskedPostcode && shouldStoreRawAnswer(rawText)) {
     setField(memory, "postcode", postcode || rawText, changedFields);
+  }
+
+  if (assistantAskedBusinessDetailsConfirmation) {
+    if (isAffirmativeAnswer(rawText)) {
+      setField(memory, "businessDetailsConfirmed", "yes", changedFields);
+      setField(memory, "correctBusinessConfirmed", "yes", changedFields);
+
+      if (knownBusinessName) {
+        setField(memory, "businessName", knownBusinessName, changedFields);
+      }
+
+      if (knownBusinessPhone) {
+        setField(memory, "phoneNumber", knownBusinessPhone, changedFields);
+      }
+    } else if (isNegativeAnswer(rawText) || shouldStoreRawAnswer(rawText)) {
+      setField(memory, "businessDetailsConfirmed", "no", changedFields);
+
+      const correctedBusinessName =
+        extractBusinessName(rawText) || normaliseBusinessNameAnswer(rawText);
+      const correctedPhoneNumber = extractPhoneNumber(rawText);
+
+      if (correctedBusinessName && !isNegativeAnswer(rawText)) {
+        setField(memory, "businessName", correctedBusinessName, changedFields);
+      }
+
+      if (correctedPhoneNumber) {
+        setField(memory, "phoneNumber", correctedPhoneNumber, changedFields);
+      }
+
+      if (shouldStoreRawAnswer(rawText)) {
+        pushNote(memory, `Business detail correction: ${rawText}`, changedFields);
+      }
+    }
+  }
+
+  if (assistantAskedOwnerStatus) {
+    if (
+      isAffirmativeAnswer(rawText) ||
+      hasAny(lower, [
+        "i am the owner",
+        "i'm the owner",
+        "i own it",
+        "i own the business",
+        "i run it",
+      ])
+    ) {
+      setField(memory, "isBusinessOwner", "yes", changedFields);
+      setField(memory, "authorisedDecisionMaker", "yes", changedFields);
+      setField(memory, "isDecisionMaker", "yes", changedFields);
+    }
+
+    if (
+      isNegativeAnswer(rawText) ||
+      hasAny(lower, [
+        "not the owner",
+        "i am not the owner",
+        "i'm not the owner",
+      ])
+    ) {
+      setField(memory, "isBusinessOwner", "no", changedFields);
+    }
+  }
+
+  if (assistantAskedFinancialAuthority) {
+    if (
+      isAffirmativeAnswer(rawText) ||
+      hasAny(lower, [
+        "i can",
+        "yes i do",
+        "i handle that",
+        "that is me",
+      ])
+    ) {
+      setField(memory, "authorisedDecisionMaker", "yes", changedFields);
+      setField(memory, "isDecisionMaker", "yes", changedFields);
+    }
+
+    if (
+      isNegativeAnswer(rawText) ||
+      hasAny(lower, [
+        "i cannot",
+        "i don't",
+        "i do not",
+        "someone else does",
+      ])
+    ) {
+      setField(memory, "authorisedDecisionMaker", "no", changedFields);
+      setField(memory, "isDecisionMaker", "no", changedFields);
+    }
   }
 
   if (assistantAskedDecisionMaker) {
@@ -639,6 +865,8 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
       "i look after the marketing",
     ])
   ) {
+    setField(memory, "isBusinessOwner", "yes", changedFields);
+    setField(memory, "authorisedDecisionMaker", "yes", changedFields);
     setField(memory, "isDecisionMaker", "yes", changedFields);
   }
 
@@ -721,7 +949,6 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
       setField(memory, "interestInMoreEnquiries", "yes", changedFields);
     } else if (isNegativeAnswer(rawText)) {
       setField(memory, "interestInMoreEnquiries", "no", changedFields);
-      setField(memory, "notInterested", true, changedFields);
     } else if (shouldStoreRawAnswer(rawText)) {
       setField(memory, "interestInMoreEnquiries", rawText, changedFields);
     }
@@ -747,6 +974,16 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   if (callbackTime) {
     setField(memory, "callbackTime", callbackTime, changedFields);
     setField(memory, "callbackRequested", true, changedFields);
+  }
+
+  if (assistantAskedCallbackConsent) {
+    if (isAffirmativeAnswer(rawText)) {
+      setField(memory, "callbackConsent", "yes", changedFields);
+      setField(memory, "callbackRequested", true, changedFields);
+    } else if (isNegativeAnswer(rawText)) {
+      setField(memory, "callbackConsent", "no", changedFields);
+      setField(memory, "callbackRequested", true, changedFields);
+    }
   }
 
   if (assistantAskedCallbackDay && shouldStoreRawAnswer(rawText)) {
@@ -823,11 +1060,16 @@ function formatSessionMemoryForPrompt(memory) {
 
   return [
     `Contact name: ${formatValue(memory.contactName)}`,
+    `Contact title: ${formatValue(memory.contactTitle)}`,
     `Correct business confirmed: ${formatValue(memory.correctBusinessConfirmed)}`,
+    `Business details confirmed: ${formatValue(memory.businessDetailsConfirmed)}`,
+    `Address confirmed: ${formatValue(memory.addressConfirmed)}`,
     `Business name: ${formatValue(memory.businessName)}`,
     `Business address: ${formatValue(memory.businessAddress)}`,
     `Postcode: ${formatValue(memory.postcode)}`,
+    `Business owner status: ${formatValue(memory.isBusinessOwner)}`,
     `Decision maker status: ${formatValue(memory.isDecisionMaker)}`,
+    `Authorised decision maker status: ${formatValue(memory.authorisedDecisionMaker)}`,
     `Decision maker name: ${formatValue(memory.decisionMakerName)}`,
     `Decision maker role: ${formatValue(memory.decisionMakerRole)}`,
     `Phone number: ${formatValue(memory.phoneNumber)}`,
@@ -837,6 +1079,7 @@ function formatSessionMemoryForPrompt(memory) {
     `Gets enquiries online: ${formatValue(memory.onlineEnquiryStatus)}`,
     `Interested in more enquiries: ${formatValue(memory.interestInMoreEnquiries)}`,
     `Industry: ${formatValue(memory.industry)}`,
+    `Callback consent: ${formatValue(memory.callbackConsent)}`,
     `Callback date: ${formatValue(memory.callbackDate)}`,
     `Callback time: ${formatValue(memory.callbackTime)}`,
     `Busy: ${formatValue(memory.busy)}`,
@@ -850,11 +1093,16 @@ function formatSessionMemoryForPrompt(memory) {
 function formatSessionMemoryForLog(memory) {
   return {
     contactName: memory.contactName,
+    contactTitle: memory.contactTitle,
     correctBusinessConfirmed: memory.correctBusinessConfirmed,
+    businessDetailsConfirmed: memory.businessDetailsConfirmed,
+    addressConfirmed: memory.addressConfirmed,
     businessName: memory.businessName,
     businessAddress: memory.businessAddress,
     postcode: memory.postcode,
+    isBusinessOwner: memory.isBusinessOwner,
     isDecisionMaker: memory.isDecisionMaker,
+    authorisedDecisionMaker: memory.authorisedDecisionMaker,
     decisionMakerName: memory.decisionMakerName,
     decisionMakerRole: memory.decisionMakerRole,
     phoneNumber: memory.phoneNumber,
@@ -864,6 +1112,7 @@ function formatSessionMemoryForLog(memory) {
     onlineEnquiryStatus: memory.onlineEnquiryStatus,
     interestInMoreEnquiries: memory.interestInMoreEnquiries,
     industry: memory.industry,
+    callbackConsent: memory.callbackConsent,
     callbackDate: memory.callbackDate,
     callbackTime: memory.callbackTime,
     callbackRequested: memory.callbackRequested,

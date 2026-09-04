@@ -6,7 +6,6 @@ require("dotenv").config();
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
-const twilio = require("twilio");
 
 const {
   startOutboundCall,
@@ -15,6 +14,17 @@ const {
 const { createSpeechToTextStream } = require("./services/speech-to-text");
 const { getAIResponse } = require("./services/ai-response");
 const { textToSpeech } = require("./services/text-to-speech");
+const {
+  buildCallbackConfirmationMessage,
+  buildFinancialAuthorityClarifier,
+  buildIntroMessage,
+  callbackConsentQuestion,
+  formatCustomerAddress,
+  getScriptedNextQuestion,
+  hasCallbackSlot,
+  hasSurveyAnswers,
+  normaliseCallProfile,
+} = require("./services/survey-script");
 
 const {
   createSessionMemory,
@@ -42,7 +52,10 @@ const CLIENT_COMPANY_NAME = process.env.CLIENT_COMPANY_NAME || "118 Online";
 
 const INTRO_MESSAGE =
   process.env.INTRO_MESSAGE ||
-  `Hi, my name is ${AGENT_NAME} calling on behalf of ${CLIENT_COMPANY_NAME}. I am just calling regarding your business and online visibility. Could I ask who I am speaking with please?`;
+  buildIntroMessage({
+    agentName: AGENT_NAME,
+    companyName: CLIENT_COMPANY_NAME,
+  });
 
 const SILENCE_CHECK_MESSAGE =
   process.env.SILENCE_CHECK_MESSAGE || "Hello, are you still there?";
@@ -140,13 +153,7 @@ app.get("/health", (req, res) => {
 // }
 app.post("/start-call", async (req, res) => {
   try {
-    const {
-      to,
-      phone_number_id,
-      phoneNumberId,
-      callback_url,
-      callbackUrl,
-    } = req.body;
+    const { to, callback_url, callbackUrl } = req.body;
 
     if (!to) {
       return res.status(400).json({
@@ -155,7 +162,8 @@ app.post("/start-call", async (req, res) => {
       });
     }
 
-    const resolvedPhoneNumberId = phone_number_id || phoneNumberId || null;
+    const callProfile = normaliseCallProfile(req.body);
+    const resolvedPhoneNumberId = callProfile.phoneNumberId || null;
     const resolvedCallbackUrl = normaliseCallbackUrl(
       callback_url || callbackUrl || DEFAULT_RAILS_CALLBACK_URL
     );
@@ -167,6 +175,7 @@ app.post("/start-call", async (req, res) => {
       callbackUrl: resolvedCallbackUrl,
       to,
       startedAt: new Date().toISOString(),
+      callProfile,
     });
 
     console.log("Call context stored:", {
@@ -174,6 +183,7 @@ app.post("/start-call", async (req, res) => {
       phoneNumberId: resolvedPhoneNumberId,
       callbackUrl: resolvedCallbackUrl,
       to,
+      businessName: callProfile.customer.businessName || null,
     });
 
     res.json({
@@ -182,6 +192,7 @@ app.post("/start-call", async (req, res) => {
       callSid: call.sid,
       callbackUrl: resolvedCallbackUrl,
       phoneNumberId: resolvedPhoneNumberId,
+      callProfile,
     });
   } catch (error) {
     console.error("Call error:", error.message);
@@ -425,61 +436,37 @@ wss.on("connection", (ws) => {
     return normaliseTranscriptText(`${combinedTranscript} ${fallback}`);
   }
 
-  function hasWebsiteBranchDetail(memory) {
-    if (memory.websiteStatus === "yes") {
-      return Boolean(memory.websiteAge);
+  function getCurrentCallProfile() {
+    if (callContext?.callProfile) {
+      return callContext.callProfile;
     }
 
-    if (memory.websiteStatus === "no") {
-      return Boolean(memory.websiteInterestLevel);
-    }
-
-    return false;
+    return normaliseCallProfile({
+      phoneNumberId: callContext?.phoneNumberId || null,
+      to: callContext?.to || "",
+    });
   }
 
-  function hasQualificationDetails(memory) {
+  function qualificationReadyForConsent(memory) {
     return Boolean(
-      memory.contactName &&
-        memory.businessName &&
-        memory.businessAddress &&
-        memory.postcode &&
-        memory.isDecisionMaker === "yes" &&
-        memory.websiteStatus &&
-        hasWebsiteBranchDetail(memory) &&
-        memory.onlineEnquiryStatus &&
-        memory.interestInMoreEnquiries &&
-        memory.industry
+      memory.isDecisionMaker === "yes" &&
+        memory.addressConfirmed &&
+        memory.businessDetailsConfirmed &&
+        memory.contactName &&
+        hasSurveyAnswers(memory)
     );
   }
 
-  function hasCallbackSlot(memory) {
-    return Boolean(memory.callbackDate && memory.callbackTime);
-  }
-
-  function buildCallbackConfirmationMessage(memory) {
-    const date = memory.callbackDate || "the agreed day";
-    const time = memory.callbackTime || "the agreed time";
-    const lowerTime = String(time).toLowerCase();
-    const timePhrase =
-      lowerTime === "morning" || lowerTime === "afternoon" || lowerTime === "evening"
-        ? `${date} in the ${lowerTime}`
-        : lowerTime === "lunchtime"
-          ? `${date} at lunchtime`
-          : `${date} at ${time}`;
-
-    return `Perfect, I have arranged a callback for ${timePhrase}. Thank you for your time and we will speak with you then.`;
-  }
-
   function determineCallOutcome(reason) {
+    if (sessionMemory.doNotCall) {
+      return "Do not call";
+    }
+
     if (sessionMemory.callbackConfirmed || hasCallbackSlot(sessionMemory)) {
       return "Callback booked";
     }
 
-    if (
-      sessionMemory.notInterested ||
-      sessionMemory.doNotCall ||
-      sessionMemory.interestInMoreEnquiries === "no"
-    ) {
+    if (sessionMemory.notInterested) {
       return "Not interested";
     }
 
@@ -487,12 +474,12 @@ wss.on("connection", (ws) => {
       return "Wrong number";
     }
 
-    if (
-      sessionMemory.isDecisionMaker === "yes" ||
-      (sessionMemory.isDecisionMaker === "no" &&
-        (sessionMemory.decisionMakerName || sessionMemory.decisionMakerRole))
-    ) {
-      return "Decision maker identified";
+    if (sessionMemory.isDecisionMaker === "yes" && hasSurveyAnswers(sessionMemory)) {
+      return "Survey completed";
+    }
+
+    if (sessionMemory.isDecisionMaker === "no") {
+      return "Decision maker unavailable";
     }
 
     if (
@@ -526,6 +513,17 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    const profile = context.callProfile || getCurrentCallProfile();
+    const profileCustomer = profile.customer || {};
+    const finalCustomerAddress = sessionMemory.businessAddress || formatCustomerAddress(profileCustomer);
+    const finalPostcode = sessionMemory.postcode || profileCustomer.postcode || null;
+    const finalBusinessName = sessionMemory.businessName || profileCustomer.businessName || null;
+    const finalPhoneNumber =
+      sessionMemory.phoneNumber || profileCustomer.phoneNumber || context.to;
+    const finalContactName = sessionMemory.contactName || profileCustomer.name || null;
+    const finalContactTitle =
+      sessionMemory.contactTitle || profileCustomer.title || null;
+
     const payload = {
       phone_number_id: context.phoneNumberId,
       to: context.to,
@@ -536,20 +534,55 @@ wss.on("connection", (ws) => {
       started_at: context.startedAt,
       ended_at: new Date().toISOString(),
       total_audio_packets: audioPacketCount,
+      customer: {
+        title: finalContactTitle,
+        name: finalContactName,
+        business_name: finalBusinessName,
+        phone_number: finalPhoneNumber,
+        address: sessionMemory.businessAddress || profileCustomer.address || null,
+        town: profileCustomer.town || null,
+        county: profileCustomer.county || null,
+        postcode: finalPostcode,
+      },
+      survey: {
+        owner: sessionMemory.isBusinessOwner,
+        authorised_decision_maker: sessionMemory.authorisedDecisionMaker,
+        decision_maker: sessionMemory.isDecisionMaker,
+        address_confirmed: sessionMemory.addressConfirmed,
+        business_details_confirmed: sessionMemory.businessDetailsConfirmed,
+        current_website: sessionMemory.websiteStatus,
+        website_age: sessionMemory.websiteAge,
+        considered_website: sessionMemory.websiteInterestLevel,
+        gets_online_enquiries: sessionMemory.onlineEnquiryStatus,
+        wants_more_enquiries: sessionMemory.interestInMoreEnquiries,
+        classification: sessionMemory.industry,
+        callback_consent: sessionMemory.callbackConsent,
+        callback_requested: sessionMemory.callbackRequested,
+        callback_date: sessionMemory.callbackDate,
+        callback_time: sessionMemory.callbackTime,
+        notes: sessionMemory.notes,
+        outcome,
+      },
       lead: {
-        contact_name: sessionMemory.contactName,
-        business_name: sessionMemory.businessName,
-        business_address: sessionMemory.businessAddress,
-        postcode: sessionMemory.postcode,
+        contact_name: finalContactName,
+        contact_title: finalContactTitle,
+        business_name: finalBusinessName,
+        business_address: finalCustomerAddress || null,
+        postcode: finalPostcode,
+        business_details_confirmed: sessionMemory.businessDetailsConfirmed,
+        address_confirmed: sessionMemory.addressConfirmed,
+        business_owner_status: sessionMemory.isBusinessOwner,
+        authorised_decision_maker: sessionMemory.authorisedDecisionMaker,
         decision_maker_name: sessionMemory.decisionMakerName,
         decision_maker_role: sessionMemory.decisionMakerRole,
-        phone_number: sessionMemory.phoneNumber || context.to,
+        phone_number: finalPhoneNumber,
         website_status: sessionMemory.websiteStatus,
         website_age: sessionMemory.websiteAge,
         website_interest_level: sessionMemory.websiteInterestLevel,
         online_enquiry_status: sessionMemory.onlineEnquiryStatus,
         interest_in_more_enquiries: sessionMemory.interestInMoreEnquiries,
         industry: sessionMemory.industry,
+        callback_consent: sessionMemory.callbackConsent,
         callback_date: sessionMemory.callbackDate,
         callback_time: sessionMemory.callbackTime,
         notes: sessionMemory.notes,
@@ -1098,18 +1131,27 @@ wss.on("connection", (ws) => {
     );
   }
 
-  function qualificationReadyForConsent(memory) {
-    return hasQualificationDetails(memory);
-  }
-
-  function callbackConsentQuestion() {
-    return "Thanks for your time. One of our UK specialists can have a quick chat with you about improving your online visibility and answering any questions you may have. What day would suit you best for a callback?";
-  }
-
-  function lastAssistantAskedForRecords() {
+  function lastAssistantAskedFinancialAuthority() {
     const lower = getLastAssistantReply().toLowerCase();
 
-    return lower.includes("for our records");
+    return (
+      lower.includes("authorised to make financial decisions") ||
+      lower.includes("authorized to make financial decisions") ||
+      lower.includes("make financial decisions on behalf of the business")
+    );
+  }
+
+  function looksLikeFinancialDecisionClarification(text) {
+    const lower = String(text || "").toLowerCase().trim();
+
+    return (
+      lower.includes("what kind of financial decisions") ||
+      lower.includes("what sort of financial decisions") ||
+      lower.includes("what do you mean by financial decisions") ||
+      lower.includes("which financial decisions") ||
+      lower === "what kind" ||
+      lower === "what do you mean"
+    );
   }
 
   function looksLikeCustomerQuestion(text) {
@@ -1128,74 +1170,7 @@ wss.on("connection", (ws) => {
     );
   }
 
-  function getScriptedNextQuestion(memory) {
-    if (!memory.contactName) {
-      return "Sorry, could I ask who I am speaking with please?";
-    }
-
-    if (!memory.businessName) {
-      return "I just wanted to confirm I have reached the right business. Could you tell me the name of your business please?";
-    }
-
-    if (!memory.businessAddress) {
-      return "Could I also confirm the best address for the business?";
-    }
-
-    if (!memory.postcode) {
-      return "And could I confirm the postcode please?";
-    }
-
-    if (!memory.isDecisionMaker) {
-      return "Are you the business owner, or are you the person who looks after decisions around advertising, websites or online marketing?";
-    }
-
-    if (memory.isDecisionMaker === "yes" && !memory.websiteStatus) {
-      return "Do you currently have a website for your business?";
-    }
-
-    if (memory.isDecisionMaker === "yes" && memory.websiteStatus === "yes" && !memory.websiteAge) {
-      return "How long have you had your website?";
-    }
-
-    if (
-      memory.isDecisionMaker === "yes" &&
-      memory.websiteStatus === "no" &&
-      !memory.websiteInterestLevel
-    ) {
-      return "Have you ever considered getting a website to help customers find your business online?";
-    }
-
-    if (memory.isDecisionMaker === "yes" && !memory.onlineEnquiryStatus) {
-      return "Do you currently receive enquiries from customers through online searches or your website?";
-    }
-
-    if (memory.isDecisionMaker === "yes" && !memory.interestInMoreEnquiries) {
-      return "Would you be interested in receiving more enquiries from customers searching online?";
-    }
-
-    if (memory.isDecisionMaker === "yes" && !memory.industry) {
-      return "What type of business or industry are you in?";
-    }
-
-    if (memory.isDecisionMaker === "yes" && !memory.callbackDate) {
-      return callbackConsentQuestion();
-    }
-
-    if (memory.isDecisionMaker === "yes" && !memory.callbackTime) {
-      return "What time would suit you best?";
-    }
-
-    return null;
-  }
-
   function getFastPathReply(memory, cleanTranscript) {
-    const lowerTranscript = String(cleanTranscript || "").toLowerCase();
-    const declinedRecords =
-      lastAssistantAskedForRecords() &&
-      /^(no|nope|nah|rather not|prefer not|i'd rather not|don't want to)\b/i.test(
-        lowerTranscript
-      );
-
     if (memory.wrongNumber || memory.correctBusinessConfirmed === "no") {
       return "Thanks for letting me know. Sorry for the disturbance. Have a great day.";
     }
@@ -1204,19 +1179,11 @@ wss.on("connection", (ws) => {
       return "I understand. Sorry for disturbing you, we will not call again. Thank you, goodbye.";
     }
 
-    if (memory.busy) {
-      if (!memory.callbackDate) {
-        return "No problem at all. What day would be better for us to call you back?";
-      }
-
-      if (!memory.callbackTime) {
-        return "What time would suit you best?";
-      }
-
-      if (!memory.callbackConfirmed) {
-        memory.callbackConfirmed = true;
-        return buildCallbackConfirmationMessage(memory);
-      }
+    if (
+      lastAssistantAskedFinancialAuthority() &&
+      looksLikeFinancialDecisionClarification(cleanTranscript)
+    ) {
+      return `${buildFinancialAuthorityClarifier()} Are you authorised to make those decisions on behalf of the business?`;
     }
 
     if (memory.callbackRequested === true && hasCallbackSlot(memory) && !memory.callbackConfirmed) {
@@ -1224,61 +1191,15 @@ wss.on("connection", (ws) => {
       return buildCallbackConfirmationMessage(memory);
     }
 
-    if (memory.notInterested || memory.interestInMoreEnquiries === "no") {
-      if (declinedRecords) {
-        return "Thank you for your time. Have a great day.";
-      }
-
-      if (!memory.contactName) {
-        return "I completely understand. Before I let you go, would you mind if I just confirm who I am speaking with for our records?";
-      }
-
-      if (!memory.businessName) {
-        return "And could I just confirm the business name for our records?";
-      }
-
+    if (memory.notInterested) {
       return "Thank you for your time. Have a great day.";
     }
 
-    if (memory.isDecisionMaker === "no") {
-      if (!memory.decisionMakerName) {
-        return "Could you let me know who would normally handle those decisions?";
-      }
-
-      if (!memory.decisionMakerRole) {
-        return "And what is their role at the business?";
-      }
-
-      if (!memory.callbackDate) {
-        return "What day would be best for one of our UK specialists to reach them?";
-      }
-
-      if (!memory.callbackTime) {
-        return "What time would suit them best?";
-      }
-
-      if (!memory.callbackConfirmed) {
-        memory.callbackConfirmed = true;
-        return buildCallbackConfirmationMessage(memory);
-      }
-    }
-
-    if (qualificationReadyForConsent(memory) && memory.interestInMoreEnquiries !== "no") {
-      if (!memory.callbackDate) {
-        return callbackConsentQuestion();
-      }
-
-      if (!memory.callbackTime) {
-        return "What time would suit you best?";
-      }
-
-      if (!memory.callbackConfirmed) {
-        memory.callbackConfirmed = true;
-        return buildCallbackConfirmationMessage(memory);
-      }
-    }
-
-    const scriptedNextQuestion = getScriptedNextQuestion(memory);
+    const scriptedNextQuestion = getScriptedNextQuestion(
+      memory,
+      getCurrentCallProfile(),
+      { companyName: CLIENT_COMPANY_NAME }
+    );
 
     if (scriptedNextQuestion && !looksLikeCustomerQuestion(cleanTranscript)) {
       return scriptedNextQuestion;
@@ -1304,10 +1225,7 @@ wss.on("connection", (ws) => {
       return true;
     }
 
-    if (
-      (sessionMemory.notInterested || sessionMemory.interestInMoreEnquiries === "no") &&
-      !replyAsksQuestion(aiReply)
-    ) {
+    if (sessionMemory.notInterested && !replyAsksQuestion(aiReply)) {
       return true;
     }
 
@@ -1321,7 +1239,10 @@ wss.on("connection", (ws) => {
     const memoryUpdate = updateSessionMemoryFromTranscript(
       sessionMemory,
       cleanTranscript,
-      { conversationHistory }
+      {
+        conversationHistory,
+        callProfile: getCurrentCallProfile(),
+      }
     );
 
     if (memoryUpdate.changedFields.length) {
@@ -1400,6 +1321,7 @@ wss.on("connection", (ws) => {
           transcript: cleanTranscript,
           conversationHistory,
           sessionMemory,
+          callProfile: getCurrentCallProfile(),
         });
       }
 
@@ -1438,7 +1360,9 @@ wss.on("connection", (ws) => {
           "AI tried to offer a handoff. Replacing with callback consent question."
         );
 
-        aiReply = callbackConsentQuestion();
+        aiReply = callbackConsentQuestion({
+          companyName: CLIENT_COMPANY_NAME,
+        });
       }
 
       if (hasCallbackSlot(sessionMemory) && !sessionMemory.callbackConfirmed) {
@@ -1738,8 +1662,11 @@ wss.on("connection", (ws) => {
         currentCallSid = data.start.callSid;
         currentStreamSid = data.start.streamSid;
         callContext = callContexts.get(currentCallSid) || null;
+        const profile = getCurrentCallProfile();
 
-        if (callContext?.to && !sessionMemory.phoneNumber) {
+        if (profile.customer?.phoneNumber && !sessionMemory.phoneNumber) {
+          sessionMemory.phoneNumber = profile.customer.phoneNumber;
+        } else if (callContext?.to && !sessionMemory.phoneNumber) {
           sessionMemory.phoneNumber = callContext.to;
         }
 
@@ -1748,6 +1675,7 @@ wss.on("connection", (ws) => {
           streamSid: currentStreamSid,
           hasCallContext: Boolean(callContext),
           phoneNumberId: callContext?.phoneNumberId || null,
+          businessName: profile.customer?.businessName || null,
         });
 
         startIntroTimer();
