@@ -109,14 +109,77 @@ function normaliseCallbackUrl(url) {
   return String(url || "").replace(/([^:]\/)\/+/g, "$1");
 }
 
+const TERMINAL_CALL_STATUSES = new Set([
+  "completed",
+  "busy",
+  "failed",
+  "no_answer",
+  "canceled",
+]);
+
 // Stores Rails/Ruby context against the Twilio callSid.
 // This lets the WebSocket part know which Rails phone_number record to update
 // when Twilio later connects the media stream.
 const callContexts = new Map();
 
-async function postCallResultToRails(callbackUrl, payload) {
+function normaliseTwilioCallStatus(status) {
+  switch (String(status || "").trim().toLowerCase()) {
+    case "queued":
+    case "initiated":
+      return "queued";
+    case "ringing":
+      return "ringing";
+    case "answered":
+    case "in-progress":
+    case "in_progress":
+      return "in_progress";
+    case "completed":
+      return "completed";
+    case "busy":
+      return "busy";
+    case "failed":
+      return "failed";
+    case "no-answer":
+    case "no_answer":
+      return "no_answer";
+    case "canceled":
+    case "cancelled":
+      return "canceled";
+    default:
+      return null;
+  }
+}
+
+function isTerminalCallStatus(status) {
+  return TERMINAL_CALL_STATUSES.has(status);
+}
+
+function buildStatusCallbackReason(twilioStatus) {
+  const cleanStatus = String(twilioStatus || "").trim();
+
+  return cleanStatus
+    ? `Twilio status callback: ${cleanStatus}`
+    : "Twilio status callback";
+}
+
+function defaultOutcomeForStatus(status) {
+  switch (status) {
+    case "busy":
+      return "Busy";
+    case "failed":
+      return "Call failed";
+    case "no_answer":
+      return "No answer";
+    case "canceled":
+      return "Call canceled";
+    default:
+      return null;
+  }
+}
+
+async function postCallEventToRails(callbackUrl, payload) {
   if (!callbackUrl) {
-    console.log("No Rails callback URL provided, skipping call result save.");
+    console.log("No Rails callback URL provided, skipping call event save.");
     return;
   }
 
@@ -133,16 +196,16 @@ async function postCallResultToRails(callbackUrl, payload) {
     const responseText = await response.text();
 
     if (!response.ok) {
-      console.error("Rails callback failed:", {
+      console.error("Rails call event callback failed:", {
         status: response.status,
         response: responseText,
       });
       return;
     }
 
-    console.log("Rails callback successful:", responseText);
+    console.log("Rails call event callback successful:", responseText);
   } catch (error) {
-    console.error("Rails callback error:", error.message);
+    console.error("Rails call event callback error:", error.message);
   }
 }
 
@@ -184,7 +247,10 @@ app.post("/start-call", async (req, res) => {
       callback_url || callbackUrl || DEFAULT_RAILS_CALLBACK_URL
     );
 
-    const call = await startOutboundCall(to);
+    const call = await startOutboundCall(to, {
+      phoneNumberId: resolvedPhoneNumberId,
+      callbackUrl: resolvedCallbackUrl,
+    });
 
     callContexts.set(call.sid, {
       phoneNumberId: resolvedPhoneNumberId,
@@ -192,6 +258,9 @@ app.post("/start-call", async (req, res) => {
       to,
       startedAt: new Date().toISOString(),
       callProfile,
+      mediaConnected: false,
+      finalResultPosted: false,
+      lastKnownStatus: "queued",
     });
 
     console.log("Call context stored:", {
@@ -217,6 +286,89 @@ app.post("/start-call", async (req, res) => {
       success: false,
       error: error.message,
     });
+  }
+});
+
+app.post("/call-status", async (req, res) => {
+  try {
+    const callSid = req.body.CallSid;
+    const twilioStatus = req.body.CallStatus;
+    const normalisedStatus = normaliseTwilioCallStatus(twilioStatus);
+    const existingContext = callContexts.get(callSid);
+    const fallbackCallbackUrl = normaliseCallbackUrl(
+      req.query.callback_url || DEFAULT_RAILS_CALLBACK_URL
+    );
+    const fallbackPhoneNumberId = req.query.phone_number_id
+      ? Number(req.query.phone_number_id)
+      : null;
+    const fallbackTo = String(req.query.to || req.body.To || "");
+
+    const context = existingContext || {
+      phoneNumberId: Number.isFinite(fallbackPhoneNumberId)
+        ? fallbackPhoneNumberId
+        : null,
+      callbackUrl: fallbackCallbackUrl,
+      to: fallbackTo,
+      startedAt: new Date().toISOString(),
+      mediaConnected: false,
+      finalResultPosted: false,
+      lastKnownStatus: normalisedStatus,
+    };
+
+    if (existingContext) {
+      existingContext.lastKnownStatus = normalisedStatus || existingContext.lastKnownStatus;
+    }
+
+    if (!callSid || !normalisedStatus) {
+      console.log("Ignoring unrecognised Twilio call status callback:", {
+        callSid,
+        twilioStatus,
+      });
+      return res.sendStatus(204);
+    }
+
+    if (!existingContext) {
+      callContexts.set(callSid, context);
+    }
+
+    const endedAt = isTerminalCallStatus(normalisedStatus)
+      ? new Date().toISOString()
+      : null;
+
+    console.log("Twilio call status callback received:", {
+      callSid,
+      twilioStatus,
+      normalisedStatus,
+      hasCallContext: Boolean(existingContext),
+      phoneNumberId: context.phoneNumberId || null,
+    });
+
+    await postCallEventToRails(context.callbackUrl, {
+      phone_number_id: context.phoneNumberId,
+      to: context.to || req.body.To || null,
+      call_sid: callSid,
+      call_status: normalisedStatus,
+      twilio_status: twilioStatus,
+      reason: buildStatusCallbackReason(twilioStatus),
+      outcome: defaultOutcomeForStatus(normalisedStatus),
+      started_at: context.startedAt,
+      ended_at: endedAt,
+    });
+
+    const latestContext = callContexts.get(callSid);
+
+    if (latestContext) {
+      latestContext.lastKnownStatus = normalisedStatus;
+
+      if (isTerminalCallStatus(normalisedStatus) && !latestContext.mediaConnected) {
+        callContexts.delete(callSid);
+      }
+    }
+
+    res.sendStatus(204);
+  } catch (error) {
+    console.error("Twilio call status callback error:", error.message);
+    res.sendStatus(500);
   }
 });
 
@@ -608,6 +760,9 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    context.finalResultPosted = true;
+    context.lastKnownStatus = "completed";
+
     const profile = context.callProfile || getCurrentCallProfile();
     const profileCustomer = profile.customer || {};
     const finalCustomerAddress = sessionMemory.businessAddress || formatCustomerAddress(profileCustomer);
@@ -624,6 +779,7 @@ wss.on("connection", (ws) => {
       to: context.to,
       call_sid: currentCallSid,
       stream_sid: currentStreamSid,
+      call_status: "completed",
       reason,
       outcome,
       started_at: context.startedAt,
@@ -697,7 +853,7 @@ wss.on("connection", (ws) => {
       reason,
     });
 
-    await postCallResultToRails(context.callbackUrl, payload);
+    await postCallEventToRails(context.callbackUrl, payload);
 
     callContexts.delete(currentCallSid);
   }
@@ -1895,6 +2051,12 @@ wss.on("connection", (ws) => {
         currentCallSid = data.start.callSid;
         currentStreamSid = data.start.streamSid;
         callContext = callContexts.get(currentCallSid) || null;
+
+        if (callContext) {
+          callContext.mediaConnected = true;
+          callContext.lastKnownStatus = "in_progress";
+        }
+
         const profile = getCurrentCallProfile();
 
         if (profile.customer?.phoneNumber && !sessionMemory.phoneNumber) {

@@ -17,7 +17,7 @@ function getTwilioClient() {
   return twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 }
 
-async function startOutboundCall(customerPhoneNumber) {
+async function startOutboundCall(customerPhoneNumber, options = {}) {
   if (!customerPhoneNumber) {
     throw new Error("Customer phone number is required");
   }
@@ -31,11 +31,15 @@ async function startOutboundCall(customerPhoneNumber) {
   }
 
   const client = getTwilioClient();
+  const statusCallbackUrl = buildStatusCallbackUrl(customerPhoneNumber, options);
 
   const call = await client.calls.create({
     to: customerPhoneNumber,
     from: TWILIO_PHONE_NUMBER,
     url: `${APP_PUBLIC_URL}/voice`,
+    statusCallback: statusCallbackUrl,
+    statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
+    statusCallbackMethod: "POST",
   });
 
   return call;
@@ -53,6 +57,24 @@ async function endOutboundCall(callSid) {
   });
 
   return call;
+}
+
+function buildStatusCallbackUrl(customerPhoneNumber, options = {}) {
+  const url = new URL(`${APP_PUBLIC_URL}/call-status`);
+
+  if (options.phoneNumberId) {
+    url.searchParams.set("phone_number_id", String(options.phoneNumberId));
+  }
+
+  if (options.callbackUrl) {
+    url.searchParams.set("callback_url", String(options.callbackUrl));
+  }
+
+  if (customerPhoneNumber) {
+    url.searchParams.set("to", String(customerPhoneNumber));
+  }
+
+  return url.toString();
 }
 
 module.exports = {
