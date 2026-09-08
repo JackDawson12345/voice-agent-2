@@ -1512,7 +1512,7 @@ wss.on("connection", (ws) => {
       ? `Hello ${contactName}, thanks for taking the call.`
       : "Hello, thanks for taking the call.";
 
-    return `${greetingPrefix} As I was saying, I am calling on behalf of ${SPOKEN_CLIENT_COMPANY_NAME} regarding online visibility for businesses. Are you the business owner?`;
+    return `${greetingPrefix} As I was saying, I am calling on behalf of ${SPOKEN_CLIENT_COMPANY_NAME} to carry out a short survey with local businesses. Are you the business owner?`;
   }
 
   function buildOwnerStatusFollowUpReply(memory) {
