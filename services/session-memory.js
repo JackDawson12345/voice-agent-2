@@ -2,6 +2,7 @@
 
 const {
   formatCustomerAddress,
+  hasDeclinedCallback,
   inferQuestionKeyFromAssistantReply,
   isFinancialAuthorityPrompt,
 } = require("./survey-script");
@@ -906,6 +907,51 @@ function promptMatches(promptKey, expectedKey, fallbackText, patterns) {
   return hasAny(fallbackText, patterns);
 }
 
+function isCallbackRefusal(text, promptKey, promptText) {
+  const answer = normaliseSpeechText(text)
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[,;:]/g, " ")
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+  const callbackMentioned = /\b(?:(?:call|ring)\s*(?:(?:me|us|them)\s+)?back|follow[ -]?up)\b/.test(answer);
+  const explicitRefusal = callbackMentioned && (
+    /\b(?:don'?t|do not|wouldn't|would not)\s+(?:want|wanna|need|like)\b/.test(answer) ||
+    /\b(?:no|without)\s+(?:(?:a|any|another)\s+)?call\s*back\b/.test(answer) ||
+    /\b(?:not interested|no need|cancel|don't call|do not call)\b/.test(answer)
+  );
+  const answeringCallback = ["callback_consent", "callback_day", "callback_time", "callback_general"].includes(promptKey) ||
+    (!promptKey && /\b(?:callback|call (?:you |me )?back)\b/i.test(promptText));
+
+  if (explicitRefusal) {
+    return true;
+  }
+
+  if (!answeringCallback) {
+    return false;
+  }
+
+  if (/\b(?:no thanks|no thank you|not interested|rather not)\b/.test(answer) ||
+      /^(?:(?:oh|sorry)\s+)?(?:none|never|no time|no day)(?:\s+(?:thanks|thank you))?$/.test(answer)) {
+    return true;
+  }
+
+  // A negative answer with an alternative slot ("No, Friday at 3 pm")
+  // changes the proposed time rather than refusing the callback itself.
+  return !extractDateLikeText(answer) && !normaliseCallbackTimeAnswer(answer) && (
+    isSimpleNo(answer) ||
+    /\b(?:no|nope|nah|not now|not today|don'?t want|do not want|don'?t wanna)\b/.test(answer)
+  );
+}
+
+function recordCallbackRefusal(memory, changedFields) {
+  setField(memory, "callbackConsent", "no", changedFields);
+  setField(memory, "callbackRequested", false, changedFields);
+  setField(memory, "callbackConfirmed", false, changedFields);
+  clearField(memory, "callbackDate", changedFields);
+  clearField(memory, "callbackTime", changedFields);
+  setField(memory, "busy", false, changedFields);
+}
+
 function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   const changedFields = [];
   const rawText = cleanValue(transcript);
@@ -946,6 +992,15 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   ) {
     setField(memory, "doNotCall", true, changedFields);
     setField(memory, "notInterested", true, changedFields);
+  }
+
+  if (memory.doNotCall || hasDeclinedCallback(memory) ||
+      isCallbackRefusal(questionRawText, promptKey, lastAssistant)) {
+    recordCallbackRefusal(memory, changedFields);
+    if (changedFields.length) {
+      memory.lastUpdatedAt = new Date().toISOString();
+    }
+    return { changedFields, memory };
   }
 
   if (
@@ -1540,8 +1595,12 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     }
   }
 
-  const callbackDate = extractDateLikeText(questionRawText);
-  const callbackTime = normaliseCallbackTimeAnswer(questionRawText);
+  const schedulingText = questionRawText.replace(/^(?:no|nope|nah)[,.!\s]+/i, "");
+  const rejectedSlot = (assistantAskedCallbackConsent || assistantAskedCallbackDay ||
+    assistantAskedCallbackTime || assistantAskedCallbackGeneral) &&
+    /^(?:not|can't|cannot|don't|do not|won't|will not)\b/i.test(schedulingText);
+  const callbackDate = rejectedSlot ? null : extractDateLikeText(questionRawText);
+  const callbackTime = rejectedSlot ? null : normaliseCallbackTimeAnswer(questionRawText);
 
   if (callbackDate) {
     setField(memory, "callbackDate", callbackDate, changedFields);
@@ -1554,18 +1613,19 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   }
 
   if (assistantAskedCallbackConsent) {
-    if (isAffirmativeAnswer(questionRawText)) {
+    if (isAffirmativeAnswer(questionRawText) || callbackDate || callbackTime) {
       setField(memory, "callbackConsent", "yes", changedFields);
-      setField(memory, "callbackRequested", true, changedFields);
-    } else if (isNegativeAnswer(questionRawText)) {
-      setField(memory, "callbackConsent", "no", changedFields);
       setField(memory, "callbackRequested", true, changedFields);
     }
   }
 
   if (assistantAskedCallbackDay && shouldStoreRawAnswer(questionRawText)) {
-    setField(memory, "callbackDate", callbackDate || questionRawText, changedFields);
-    setField(memory, "callbackRequested", true, changedFields);
+    if (callbackDate) {
+      setField(memory, "callbackDate", callbackDate, changedFields);
+      setField(memory, "callbackRequested", true, changedFields);
+    } else {
+      pushNote(memory, `Unclear callback day: ${questionRawText}`, changedFields);
+    }
   }
 
   if (assistantAskedCallbackTime && shouldStoreRawAnswer(questionRawText)) {

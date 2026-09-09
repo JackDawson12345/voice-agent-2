@@ -16,12 +16,14 @@ const { getAIResponse } = require("./services/ai-response");
 const { textToSpeech } = require("./services/text-to-speech");
 const {
   buildCallbackConfirmationMessage,
+  buildCallbackDeclinedMessage,
   buildFinancialAuthorityClarifier,
   buildIntroMessage,
   callbackConsentQuestion,
   formatCustomerAddress,
   getScriptedNextQuestion,
   hasCallbackSlot,
+  hasDeclinedCallback,
   hasSurveyAnswers,
   inferQuestionKeyFromAssistantReply,
   isFinancialAuthorityPrompt,
@@ -696,7 +698,8 @@ wss.on("connection", (ws) => {
 
   function qualificationReadyForConsent(memory) {
     return Boolean(
-      memory.isDecisionMaker === "yes" &&
+      !hasDeclinedCallback(memory) &&
+        memory.isDecisionMaker === "yes" &&
         memory.addressConfirmed &&
         memory.businessDetailsConfirmed &&
         memory.contactName &&
@@ -707,6 +710,11 @@ wss.on("connection", (ws) => {
   function determineCallOutcome(reason) {
     if (sessionMemory.doNotCall) {
       return "Do not call";
+    }
+
+    if (hasDeclinedCallback(sessionMemory)) {
+      return sessionMemory.isDecisionMaker === "yes" && hasSurveyAnswers(sessionMemory)
+        ? "Survey completed" : "Not interested";
     }
 
     if (sessionMemory.callbackConfirmed || hasCallbackSlot(sessionMemory)) {
@@ -1544,6 +1552,10 @@ wss.on("connection", (ws) => {
       return "I understand. Sorry for disturbing you, we will not call again. Thank you, goodbye.";
     }
 
+    if (hasDeclinedCallback(memory)) {
+      return buildCallbackDeclinedMessage();
+    }
+
     if (
       lastAssistantAskedFinancialAuthority() &&
       looksLikeFinancialDecisionClarification(cleanTranscript)
@@ -1590,7 +1602,7 @@ wss.on("connection", (ws) => {
   }
 
   function shouldEndCallAfterReply({ cleanTranscript, sessionMemory, aiReply }) {
-    if (sessionMemory.doNotCall) {
+    if (sessionMemory.doNotCall || hasDeclinedCallback(sessionMemory)) {
       return true;
     }
 
@@ -1753,7 +1765,10 @@ wss.on("connection", (ws) => {
         });
       }
 
-      if (hasCallbackSlot(sessionMemory) && !sessionMemory.callbackConfirmed) {
+      if (hasDeclinedCallback(sessionMemory) && !sessionMemory.doNotCall &&
+          !sessionMemory.wrongNumber && sessionMemory.correctBusinessConfirmed !== "no") {
+        aiReply = buildCallbackDeclinedMessage();
+      } else if (hasCallbackSlot(sessionMemory) && !sessionMemory.callbackConfirmed) {
         console.log("Callback slot captured. Confirming and ending the call.");
         aiReply = buildCallbackConfirmationMessage(sessionMemory);
         sessionMemory.callbackConfirmed = true;
@@ -1802,7 +1817,9 @@ wss.on("connection", (ws) => {
       if (shouldHangUp) {
         const hangupReason = sessionMemory.callbackConfirmed
           ? "Callback arranged"
-          : "Final AI message finished playing";
+          : hasDeclinedCallback(sessionMemory)
+            ? "Callback declined"
+            : "Final AI message finished playing";
 
         scheduleHangupAfterMark(
           markName,

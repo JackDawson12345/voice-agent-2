@@ -170,8 +170,19 @@ function hasSurveyAnswers(memory = {}) {
   );
 }
 
+function hasDeclinedCallback(memory = {}) {
+  return memory.callbackConsent === "no" || memory.callbackRequested === false;
+}
+
 function hasCallbackSlot(memory = {}) {
-  return Boolean(memory.callbackDate && memory.callbackTime);
+  return Boolean(
+    !hasDeclinedCallback(memory) && !memory.doNotCall &&
+    memory.callbackDate && memory.callbackTime
+  );
+}
+
+function buildCallbackDeclinedMessage() {
+  return "No problem, we won't arrange a callback. Thank you for your time. Goodbye.";
 }
 
 function buildCallbackConfirmationMessage(memory = {}) {
@@ -310,12 +321,13 @@ function inferQuestionKeyFromAssistantReply(reply = "") {
 
   if (
     lower.includes("to thank you for taking part in the survey") ||
-    lower.includes("no cost basic listing")
+    lower.includes("no cost basic listing") ||
+    lower.includes("would you like us to call back")
   ) {
     return "callback_consent";
   }
 
-  if (lower.includes("what day would suit")) {
+  if (lower.includes("what day would suit") || lower.includes("what day would be better")) {
     return "callback_day";
   }
 
@@ -343,7 +355,7 @@ function getScriptedNextQuestion(
       memory.businessDetailsCorrectionConfirmed
   );
 
-  if (memory.doNotCall || memory.wrongNumber) {
+  if (memory.doNotCall || memory.wrongNumber || hasDeclinedCallback(memory)) {
     return null;
   }
 
@@ -368,8 +380,12 @@ function getScriptedNextQuestion(
   }
 
   if (memory.isDecisionMaker === "no") {
+    if (!memory.callbackConsent && memory.callbackRequested !== true) {
+      return "No problem. Would you like us to call back when the owner or the person who handles advertising or website decisions is available?";
+    }
+
     if (!memory.callbackDate) {
-      return "No problem. Could we give you a call back when the owner or the person who handles advertising or website decisions is available? What day would suit best?";
+      return "What day would suit best for that callback?";
     }
 
     if (!memory.callbackTime) {
@@ -448,10 +464,6 @@ function getScriptedNextQuestion(
   }
 
   if (!memory.callbackDate) {
-    if (memory.callbackConsent === "no") {
-      return "No problem. Could we give you a call back at a more suitable time? What day would suit you best?";
-    }
-
     return "Fantastic. What day would suit you best for the callback?";
   }
 
@@ -473,6 +485,10 @@ function getNextStepInstruction(
 
   if (memory.wrongNumber || memory.correctBusinessConfirmed === "no") {
     return "They said this is the wrong business or wrong number. Apologise briefly and end the call.";
+  }
+
+  if (hasDeclinedCallback(memory)) {
+    return `They declined a callback. Say "${buildCallbackDeclinedMessage()}" and end the call. Do not ask for a callback day or time or offer another callback.`;
   }
 
   if (hasCallbackSlot(memory) && !memory.callbackConfirmed) {
@@ -516,6 +532,7 @@ module.exports = {
   buildAddressVerificationQuestion,
   buildBusinessVerificationQuestion,
   buildCallbackConfirmationMessage,
+  buildCallbackDeclinedMessage,
   buildFinancialAuthorityClarifier,
   buildIndustryConfirmationQuestion,
   buildIntroMessage,
@@ -525,6 +542,7 @@ module.exports = {
   getNextStepInstruction,
   getScriptedNextQuestion,
   hasCallbackSlot,
+  hasDeclinedCallback,
   hasSurveyAnswers,
   hasWebsiteBranchDetail,
   inferQuestionKeyFromAssistantReply,
