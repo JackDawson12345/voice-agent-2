@@ -292,7 +292,15 @@ function inferQuestionKeyFromAssistantReply(reply = "") {
     return "website_status";
   }
 
-  if (lower.includes("how long have you had the website")) {
+  if (lower.includes("did you say you've had the website for")) {
+    return "website_age_confirmation";
+  }
+
+  if (
+    lower.includes("how long have you had the website") ||
+    lower.includes("how long have you had your website") ||
+    lower.includes("how many months or years have you had the website")
+  ) {
     return "website_age";
   }
 
@@ -436,6 +444,14 @@ function getScriptedNextQuestion(
   }
 
   if (memory.websiteStatus === "yes" && !memory.websiteAge) {
+    if (memory.pendingWebsiteAge) {
+      return `Did you say you've had the website for ${memory.pendingWebsiteAge}?`;
+    }
+
+    if (memory.websiteAgeNeedsClarification) {
+      return "Sorry, how many months or years have you had the website?";
+    }
+
     return "How long have you had the website for?";
   }
 

@@ -479,6 +479,7 @@ wss.on("connection", (ws) => {
 
   let callContext = null;
   let callResultSent = false;
+  let speechToText = null;
 
   let aiIsThinking = false;
   let lastFinalTranscript = "";
@@ -1578,6 +1579,10 @@ wss.on("connection", (ws) => {
       { companyName: SPOKEN_CLIENT_COMPANY_NAME }
     );
 
+    if (scriptedNextQuestion && /^(?:who is this|who's this|who are you|who is calling|who's calling)[?.!\s]*$/i.test(cleanTranscript)) {
+      return `My name is ${AGENT_NAME}, calling on behalf of ${SPOKEN_CLIENT_COMPANY_NAME} about our short online visibility survey. ${scriptedNextQuestion}`;
+    }
+
     if (
       scriptedNextQuestion === "So are you the business owner?" &&
       !hasPriorCustomerTurn() &&
@@ -1965,7 +1970,7 @@ wss.on("connection", (ws) => {
     }, BARGE_IN_DEBOUNCE_MS);
   }
 
-  const speechToText = createSpeechToTextStream({
+  const speechToTextOptions = {
     onTranscript: async ({
       transcript,
       isFinal,
@@ -1976,7 +1981,7 @@ wss.on("connection", (ws) => {
       try {
         const cleanTranscript = normaliseTranscriptText(transcript);
 
-        if (!cleanTranscript && !utteranceEnd) {
+        if (!cleanTranscript && !utteranceEnd && !speechFinal) {
           return;
         }
 
@@ -2064,7 +2069,7 @@ wss.on("connection", (ws) => {
         await endCallNow("Transcript handling error");
       }
     },
-  });
+  };
 
   ws.on("message", (message) => {
     try {
@@ -2085,6 +2090,18 @@ wss.on("connection", (ws) => {
         }
 
         const profile = getCurrentCallProfile();
+
+        if (!speechToText) {
+          speechToText = createSpeechToTextStream({
+            ...speechToTextOptions,
+            keyterms: [
+              profile.customer?.businessName,
+              profile.customer?.address,
+              profile.customer?.town,
+              profile.customer?.county,
+            ],
+          });
+        }
 
         if (profile.customer?.phoneNumber && !sessionMemory.phoneNumber) {
           sessionMemory.phoneNumber = profile.customer.phoneNumber;
@@ -2141,7 +2158,7 @@ wss.on("connection", (ws) => {
 
         const audioBuffer = Buffer.from(data.media.payload, "base64");
 
-        speechToText.sendAudio(audioBuffer);
+        speechToText?.sendAudio(audioBuffer);
       }
 
       if (data.event === "stop") {
@@ -2151,7 +2168,7 @@ wss.on("connection", (ws) => {
         clearPendingVoicemailTimer();
         clearPendingHangupFallbackTimer();
         clearPendingFinalHangupTimer();
-        speechToText.close();
+        speechToText?.close();
 
         console.log("Final session memory:", formatSessionMemoryForLog(sessionMemory));
 
@@ -2177,7 +2194,7 @@ wss.on("connection", (ws) => {
     clearPendingVoicemailTimer();
     clearPendingHangupFallbackTimer();
     clearPendingFinalHangupTimer();
-    speechToText.close();
+    speechToText?.close();
 
     console.log("Twilio media stream disconnected", {
       callSid: currentCallSid,
@@ -2195,7 +2212,7 @@ wss.on("connection", (ws) => {
     clearPendingVoicemailTimer();
     clearPendingHangupFallbackTimer();
     clearPendingFinalHangupTimer();
-    speechToText.close();
+    speechToText?.close();
 
     console.error("WebSocket error:", error.message);
     addTranscriptLine("system", `WebSocket error: ${error.message}`);

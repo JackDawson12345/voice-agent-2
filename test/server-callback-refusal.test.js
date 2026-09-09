@@ -8,7 +8,37 @@ const surveyScript = require("../services/survey-script");
 
 // Exercise the server's real transcript, reply, playback-mark, hangup and
 // results paths, with all telephony/network services replaced by local fakes.
-test("the server closes a declined callback and posts no callback booking", async () => {
+for (const scenario of [
+  {
+    name: "the server closes a declined callback and posts no callback booking",
+    answers: ["Jack speaking.", "No. I'm not.", "No. I'm not.", "No. Thank you."],
+    websiteAge: null,
+  },
+  {
+    name: "the server preserves a correction after a presence check and confirms a misheard duration",
+    answers: [
+      "Jack speaking.", "Yes", "Yes",
+      "Yes. I'm still here. The business name is wrong.",
+      "New Business", "01632000222", "Yes", "Yes",
+      "Two. Yes.", "Yes", "I don't want a callback",
+    ],
+    websiteAge: "Two years",
+    correctedBusiness: true,
+  },
+  {
+    name: "the server combines final transcript segments on an empty speech boundary",
+    answers: [
+      "Jack speaking.", "Yes", "Yes", "Yes", "Yes",
+      { text: "Yes.", speechFinal: false, raw: { start: 0 }, expectReply: false },
+      { text: "Two years.", speechFinal: false, raw: { start: 1 }, expectReply: false },
+      { text: "", speechFinal: true, raw: { start: 2 }, expectReply: true },
+      "Who is this?", "I don't want a callback",
+    ],
+    websiteAge: "Two years",
+    identityClarification: true,
+  },
+]) {
+test(scenario.name, async () => {
   const routes = new Map();
   const spoken = [];
   const outgoing = [];
@@ -19,6 +49,7 @@ test("the server closes a declined callback and posts no callback booking", asyn
   let timerId = 0;
   let now = Date.now();
   let onTranscript;
+  let speechKeyterms;
   let websocketServer;
   const app = {
     use() {}, get() {}, all() {},
@@ -46,11 +77,12 @@ test("the server closes a declined callback and posts no callback booking", asyn
     "./services/speech-to-text": {
       createSpeechToTextStream: (options) => {
         onTranscript = options.onTranscript;
+        speechKeyterms = options.keyterms;
         return { sendAudio() {}, close() {} };
       },
     },
     "./services/ai-response": {
-      getAIResponse: async () => { throw new Error("Refusal should use the scripted closing"); },
+      getAIResponse: async () => { throw new Error("These answers should use the scripted flow"); },
     },
     "./services/text-to-speech": {
       textToSpeech: async (text) => { spoken.push(text); return Buffer.alloc(800); },
@@ -85,17 +117,26 @@ test("the server closes a declined callback and posts no callback booking", asyn
   await routes.get("/start-call")({ body: {
     to: "+441632000111", phone_number_id: 1,
     callback_url: "https://example.invalid/call-results",
+    customer: {
+      business_name: "Example Business", address: "100 Old Road",
+      town: "Middlesbrough", postcode: "TS6 0DS",
+    },
   } }, { json() {}, status() { return this; } });
   websocketServer.emit("connection", socket);
   socket.emit("message", JSON.stringify({ event: "start", start: {
     callSid: "CA-test-refusal", streamSid: "MZ-test-refusal",
   } }));
 
-  for (const text of ["Jack speaking.", "No. I'm not.", "No. I'm not.", "No. Thank you."]) {
+  assert.ok(speechKeyterms.includes("Example Business"));
+  assert.ok(speechKeyterms.includes("Middlesbrough"));
+  for (const entry of scenario.answers) {
+    const { text, speechFinal = true, raw, expectReply = true } =
+      typeof entry === "string" ? { text: entry } : entry;
     now += 2000;
     const previousReplyCount = spoken.length;
-    await onTranscript({ transcript: text, isFinal: true, speechFinal: true });
-    assert.equal(spoken.length, previousReplyCount + 1, `Missing response to ${text}`);
+    await onTranscript({ transcript: text, isFinal: true, speechFinal, raw });
+    assert.equal(spoken.length, previousReplyCount + Number(expectReply), `Unexpected reply count for ${text}`);
+    if (!expectReply) continue;
     const mark = outgoing.filter((message) => message.event === "mark").at(-1);
     socket.emit("message", JSON.stringify(mark));
   }
@@ -118,4 +159,14 @@ test("the server closes a declined callback and posts no callback booking", asyn
   assert.equal(results[0].survey.callback_date, null);
   assert.equal(results[0].survey.callback_time, null);
   assert.equal(results[0].memory.callbackConfirmed, false);
+  assert.equal(results[0].survey.website_age, scenario.websiteAge);
+  if (scenario.correctedBusiness) {
+    assert.equal(results[0].customer.business_name, "New Business");
+    assert.equal(results[0].survey.business_details_confirmed, "no");
+    assert.ok(spoken.includes("Did you say you've had the website for Two years?"));
+  }
+  if (scenario.identityClarification) {
+    assert.ok(spoken.some((text) => /^My name is Lily.*Do you get enquiries online/.test(text)));
+  }
 });
+}

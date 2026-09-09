@@ -27,6 +27,8 @@ function createSessionMemory() {
     phoneNumber: null,
     websiteStatus: null,
     websiteAge: null,
+    pendingWebsiteAge: null,
+    websiteAgeNeedsClarification: false,
     websiteInterestLevel: null,
     onlineEnquiryStatus: null,
     interestInMoreEnquiries: null,
@@ -305,17 +307,9 @@ function normaliseIndustryCandidate(text) {
 function stripPresenceCheckPrefix(text) {
   let value = cleanValue(text);
 
-  const affirmativePresenceMatch = value.match(
-    /^(yes|yeah|yep|yeh|okay|ok)[,.\s-]+(?:(?:i am|i'm|we are|we're)\s+)?(?:still here|still there|still on the line|here on the line|on the line)\b/i
-  );
-
-  if (affirmativePresenceMatch) {
-    return cleanValue(affirmativePresenceMatch[1]);
-  }
-
   value = value.replace(/^(?:hello|hi)[,.\s-]*/i, "");
   value = value.replace(
-    /^(?:(?:i am|i'm|we are|we're)\s+)?(?:still here|still there|still on the line|here on the line|on the line)\b[,.\s-]*/i,
+    /^(?:(?:yes|yeah|yep|yeh|okay|ok)[,.\s-]+)?(?:(?:i am|i'm|we are|we're)\s+)?(?:still here|still there|still on the line|here on the line|on the line|here|there)\b[,.!\s-]*/i,
     ""
   );
 
@@ -402,13 +396,16 @@ function extractHonorific(text) {
   return match ? normaliseHonorific(match[1]) : null;
 }
 
+const DURATION_QUANTITY =
+  "(?:\\d+(?:\\.\\d+)?|(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(?:[ -](?:one|two|three|four|five|six|seven|eight|nine))?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|(?:a )?(?:couple|few)(?: of)?|several|an?)";
+const DURATION_PATTERN = `${DURATION_QUANTITY}(?: and a half)?\\s*(?:years?|months?|weeks?)`;
+
 function extractDuration(text) {
+  const durationText = String(text || "").replace(/([a-z0-9])[.!?]+(?=\s|$)/gi, "$1 ");
   return (
-    extractAfterPatterns(text, [
-      /\b(\d+\s*(?:year|years|month|months|week|weeks))\b/i,
-      /\b([a-z]+\s+(?:year|years|month|months|week|weeks))\b/i,
+    extractAfterPatterns(durationText, [
+      new RegExp(`\\b(${DURATION_PATTERN}(?:[ ,]+(?:and )?${DURATION_PATTERN})?)\\b`, "i"),
       /\b(since\s+\d{4})\b/i,
-      /\b(for\s+[a-z0-9 .'-]+\s+(?:year|years|month|months|week|weeks))\b/i,
     ]) || null
   );
 }
@@ -416,7 +413,9 @@ function extractDuration(text) {
 function looksLikeWebsiteAgeAnswer(text) {
   const lower = compactText(text);
 
-  if (!lower || isAffirmativeAnswer(lower) || isNegativeAnswer(lower)) {
+  if (!lower || isSimpleYes(lower) || isSimpleNo(lower) ||
+      lower.includes("?") || /^(?:who|what|why|how|can you|could you)\b/.test(lower) ||
+      new RegExp(`\\b(?:not|isn't|wasn't)\\s+${DURATION_PATTERN}\\b`, "i").test(lower)) {
     return false;
   }
 
@@ -435,6 +434,50 @@ function looksLikeWebsiteAgeAnswer(text) {
       "new website",
     ])
   );
+}
+
+function inferMisheardWebsiteAge(text) {
+  // This is a proposed interpretation, never a direct change to the transcript
+  // or the saved answer. The caller must confirm it on the next turn.
+  const answer = normaliseSpeechText(text).replace(/,/g, " ").replace(/\s+/g, " ");
+  const match = answer.match(new RegExp(
+    `^(?:(?:about|around|roughly|for|it's|it is)\\s+)?(${DURATION_QUANTITY})\\s+yes$`, "i"
+  ));
+  if (!match) {
+    return null;
+  }
+  const unit = /^(?:1|one|a|an)$/i.test(match[1]) ? "year" : "years";
+  return `${match[1]} ${unit}`;
+}
+
+function updateWebsiteAge(memory, text, promptKey, changedFields) {
+  if (!text || text.includes("?") || /^(?:who|what|why|how|can you|could you)\b/i.test(text)) {
+    return;
+  }
+
+  const confirming = promptKey === "website_age_confirmation";
+  const candidate = inferMisheardWebsiteAge(text);
+  const answer = normaliseSpeechText(text);
+  const confirmationAnswer = answer.replace(/^(?:yes|yeah|yep|yeh)[,\s]+/i, "");
+  const confirmed = !isDetailRejection(text) &&
+    (isSimpleYes(answer) || isSimpleYes(confirmationAnswer));
+
+  if (looksLikeWebsiteAgeAnswer(text)) {
+    setField(memory, "websiteAge", extractDuration(text) || cleanValue(text), changedFields);
+    clearField(memory, "pendingWebsiteAge", changedFields);
+    setField(memory, "websiteAgeNeedsClarification", false, changedFields);
+  } else if (candidate) {
+    setField(memory, "pendingWebsiteAge", candidate, changedFields);
+    setField(memory, "websiteAgeNeedsClarification", false, changedFields);
+  } else if (confirming && memory.pendingWebsiteAge && confirmed) {
+    setField(memory, "websiteAge", memory.pendingWebsiteAge, changedFields);
+    clearField(memory, "pendingWebsiteAge", changedFields);
+    setField(memory, "websiteAgeNeedsClarification", false, changedFields);
+  } else {
+    clearField(memory, "pendingWebsiteAge", changedFields);
+    setField(memory, "websiteAgeNeedsClarification", true, changedFields);
+    pushNote(memory, `Unclear website age answer: ${text}`, changedFields);
+  }
 }
 
 function extractDateLikeText(text) {
@@ -959,7 +1002,7 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   const hasPresencePrefix = strippedPresenceText !== rawText;
   const questionRawText =
     hasPresencePrefix && !strippedPresenceText ? "" : strippedPresenceText || rawText;
-  const speechText = normaliseSpeechText(questionRawText || rawText);
+  const speechText = normaliseSpeechText(questionRawText);
   const lower = rawText.toLowerCase();
   const questionLower = questionRawText.toLowerCase();
   const lastAssistant = getLastAssistantMessage(context.conversationHistory || [], {
@@ -1056,6 +1099,20 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
         ...callProfileCustomer,
         phoneNumber: knownBusinessPhone,
       }, changedFields);
+    }
+    if (memory.busy) {
+      setField(memory, "callbackDate", extractDateLikeText(questionRawText), changedFields);
+      setField(memory, "callbackTime", normaliseCallbackTimeAnswer(questionRawText), changedFields);
+    }
+    if (changedFields.length) {
+      memory.lastUpdatedAt = new Date().toISOString();
+    }
+    return { changedFields, memory };
+  }
+
+  if (promptKey === "website_age" || promptKey === "website_age_confirmation") {
+    if (!memory.wrongNumber && !memory.doNotCall && !memory.busy && !memory.notInterested) {
+      updateWebsiteAge(memory, questionRawText, promptKey, changedFields);
     }
     if (memory.busy) {
       setField(memory, "callbackDate", extractDateLikeText(questionRawText), changedFields);
@@ -1183,16 +1240,6 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
       "currently have a website",
       "have a website for your business",
       "do you currently have a website",
-    ]
-  );
-
-  const assistantAskedWebsiteAge = promptMatches(
-    promptKey,
-    "website_age",
-    lastAssistantLower,
-    [
-      "how long have you had your website",
-      "how long have you had the website",
     ]
   );
 
@@ -1496,16 +1543,6 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     }
   }
 
-  if (assistantAskedWebsiteAge && shouldStoreRawAnswer(questionRawText)) {
-    const websiteAgeAnswer = extractDuration(questionRawText) || cleanValue(questionRawText);
-
-    if (looksLikeWebsiteAgeAnswer(questionRawText)) {
-      setField(memory, "websiteAge", websiteAgeAnswer, changedFields);
-    } else {
-      pushNote(memory, `Unclear website age answer: ${questionRawText}`, changedFields);
-    }
-  }
-
   if (assistantAskedWebsiteInterest && questionRawText) {
     if (isAffirmativeAnswer(questionRawText)) {
       setField(memory, "websiteInterestLevel", "yes", changedFields);
@@ -1718,6 +1755,8 @@ function formatSessionMemoryForPrompt(memory) {
     `Phone number: ${formatValue(memory.phoneNumber)}`,
     `Has website: ${formatValue(memory.websiteStatus)}`,
     `Website age: ${formatValue(memory.websiteAge)}`,
+    `Website age awaiting confirmation: ${formatValue(memory.pendingWebsiteAge)}`,
+    `Website age needs clarification: ${formatValue(memory.websiteAgeNeedsClarification)}`,
     `Website interest level: ${formatValue(memory.websiteInterestLevel)}`,
     `Gets enquiries online: ${formatValue(memory.onlineEnquiryStatus)}`,
     `Interested in more enquiries: ${formatValue(memory.interestInMoreEnquiries)}`,
@@ -1754,6 +1793,8 @@ function formatSessionMemoryForLog(memory) {
     phoneNumber: memory.phoneNumber,
     websiteStatus: memory.websiteStatus,
     websiteAge: memory.websiteAge,
+    pendingWebsiteAge: memory.pendingWebsiteAge,
+    websiteAgeNeedsClarification: memory.websiteAgeNeedsClarification,
     websiteInterestLevel: memory.websiteInterestLevel,
     onlineEnquiryStatus: memory.onlineEnquiryStatus,
     interestInMoreEnquiries: memory.interestInMoreEnquiries,
