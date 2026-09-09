@@ -4,7 +4,7 @@ const WebSocket = require("ws");
 
 function createSpeechToTextStream({ onTranscript, onOpen, onClose, onError, keyterms = [] } = {}) {
   const apiKey = process.env.DEEPGRAM_API_KEY;
-  const endpointingMs = String(process.env.DEEPGRAM_ENDPOINTING_MS || "600");
+  const endpointingMs = String(process.env.DEEPGRAM_ENDPOINTING_MS || "450");
   const utteranceEndMs = String(process.env.DEEPGRAM_UTTERANCE_END_MS || "1000");
 
   if (!apiKey) {
