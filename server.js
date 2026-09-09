@@ -94,6 +94,12 @@ const ENABLE_CALLBACK_FLOW = true;
 const CALL_SCREENING_MESSAGE =
   process.env.CALL_SCREENING_MESSAGE ||
   `Hi, my name is ${AGENT_NAME} calling on behalf of ${SPOKEN_CLIENT_COMPANY_NAME} regarding the business and online visibility.`;
+const CALL_SCREENING_WAIT_TIMEOUT_MS = Number(
+  process.env.CALL_SCREENING_WAIT_TIMEOUT_MS || 60000
+);
+if (!Number.isFinite(CALL_SCREENING_WAIT_TIMEOUT_MS) || CALL_SCREENING_WAIT_TIMEOUT_MS <= 0) {
+  throw new Error("CALL_SCREENING_WAIT_TIMEOUT_MS must be a positive number");
+}
 const VOICEMAIL_MESSAGE =
   process.env.VOICEMAIL_MESSAGE ||
   `Hi, my name is ${AGENT_NAME} calling on behalf of ${SPOKEN_CLIENT_COMPANY_NAME} regarding your business and online visibility. Please give us a call back when convenient. Thank you.`;
@@ -496,6 +502,8 @@ wss.on("connection", (ws) => {
 
   // iPhone call screening state.
   let callScreeningReplySent = false;
+  let awaitingScreenedCaller = false;
+  let callScreeningWaitTimer = null;
 
   // Voicemail / answer machine state.
   let voicemailHandled = false;
@@ -892,6 +900,14 @@ wss.on("connection", (ws) => {
     }
   }
 
+  function finishCallScreeningWait() {
+    awaitingScreenedCaller = false;
+    if (callScreeningWaitTimer) {
+      clearTimeout(callScreeningWaitTimer);
+      callScreeningWaitTimer = null;
+    }
+  }
+
   function clearPendingVoicemailTimer() {
     if (pendingVoicemailTimer) {
       clearTimeout(pendingVoicemailTimer);
@@ -998,7 +1014,7 @@ wss.on("connection", (ws) => {
   function startSilenceTimer() {
     clearSilenceTimer();
 
-    if (callIsEnding) {
+    if (callIsEnding || awaitingScreenedCaller) {
       return;
     }
 
@@ -1028,7 +1044,7 @@ wss.on("connection", (ws) => {
   }
 
   async function handleSilenceTimeout() {
-    if (callIsEnding) {
+    if (callIsEnding || awaitingScreenedCaller) {
       return;
     }
 
@@ -1057,7 +1073,7 @@ wss.on("connection", (ws) => {
 
   async function playSilenceCheckMessage() {
     try {
-      if (callIsEnding || voicemailHandled) {
+      if (callIsEnding || voicemailHandled || awaitingScreenedCaller) {
         return;
       }
 
@@ -1090,6 +1106,7 @@ wss.on("connection", (ws) => {
       if (
         callIsEnding ||
         voicemailHandled ||
+        awaitingScreenedCaller ||
         thisResponseId !== responseGenerationId
       ) {
         console.log("Silence check cancelled before playback");
@@ -1120,6 +1137,7 @@ wss.on("connection", (ws) => {
 
       callIsEnding = true;
       callEndReason = reason;
+      finishCallScreeningWait();
 
       console.log("Ending call:", reason);
 
@@ -1224,6 +1242,24 @@ wss.on("connection", (ws) => {
     );
   }
 
+  function isCallScreeningFollowUp(text) {
+    const normalised = normaliseTranscriptText(text)
+      .toLowerCase()
+      .replace(/’/g, "'")
+      .replace(/[.,!?;:]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    // Match only screening acknowledgements/hold announcements, not a human
+    // greeting or answer that happens to contain "thanks" or "hold".
+    const remaining = normalised
+      .replace(/^(?:thanks|thank you)(?: very much)?\b\s*/, "")
+      .replace(/^(?:please )?(?:stay on the line|hold(?: on| the line)?|wait(?: a moment| a minute)?)(?: please)?\b\s*/, "")
+      .replace(/^(?:while )?(?:i|we)(?:'ll| will)? (?:see if (?:this person|they)(?: is| are|'re) available|(?:try to )?(?:connect you|put you through|let (?:them|this person) know(?: (?:that )?you(?:'re| are) calling)?))\s*$/, "");
+
+    return Boolean(normalised) && !remaining;
+  }
+
   async function answerIphoneCallScreeningPrompt() {
     if (callScreeningReplySent) {
       return;
@@ -1235,12 +1271,25 @@ wss.on("connection", (ws) => {
     }
 
     callScreeningReplySent = true;
+    awaitingScreenedCaller = true;
     customerHasSpoken = true;
     silenceCheckCount = 0;
     resetPendingCustomerUtterance();
+    pendingFluxPrompt = null;
 
     clearIntroTimer();
-    clearSilenceTimer();
+    // Stop an intro or response already playing/synthesising before answering
+    // the screener. Its delayed mark must not restart the silence timer.
+    interruptCurrentResponse("");
+    updateActivePrompt("");
+
+    // This deadline is independent of customer silence and is not extended
+    // by repeated screening announcements or empty transcript events.
+    callScreeningWaitTimer = setTimeout(async () => {
+      callScreeningWaitTimer = null;
+      if (!awaitingScreenedCaller || callIsEnding) return;
+      await endCallNow("Call screening timed out waiting for the recipient");
+    }, CALL_SCREENING_WAIT_TIMEOUT_MS);
 
     const screeningReply = CALL_SCREENING_MESSAGE;
 
@@ -1252,7 +1301,7 @@ wss.on("connection", (ws) => {
     const thisResponseId = ++responseGenerationId;
     const screeningAudio = await textToSpeech(screeningReply);
 
-    if (thisResponseId !== responseGenerationId) {
+    if (callIsEnding || !awaitingScreenedCaller || thisResponseId !== responseGenerationId) {
       console.log("Call screening reply cancelled");
       return;
     }
@@ -1262,8 +1311,6 @@ wss.on("connection", (ws) => {
     activeAudioMark = markName;
     aiIsSpeaking = true;
     interruptionHappened = false;
-
-    markShouldStartSilenceTimer(markName);
 
     sendAudioToTwilio(ws, currentStreamSid, screeningAudio, markName);
     updateActivePrompt(screeningReply);
@@ -1324,6 +1371,7 @@ wss.on("connection", (ws) => {
     }
 
     voicemailHandled = true;
+    finishCallScreeningWait();
     customerHasSpoken = true;
     resetPendingCustomerUtterance();
 
@@ -1531,8 +1579,11 @@ wss.on("connection", (ws) => {
     const greetingPrefix = contactName
       ? `Hello ${contactName}, thanks for taking the call.`
       : "Hello, thanks for taking the call.";
+    const introduction = callScreeningReplySent
+      ? "I am calling"
+      : "As I was saying, I am calling";
 
-    return `${greetingPrefix} As I was saying, I am calling on behalf of ${SPOKEN_CLIENT_COMPANY_NAME} to carry out a short survey with local businesses. Are you the business owner?`;
+    return `${greetingPrefix} ${introduction} on behalf of ${SPOKEN_CLIENT_COMPANY_NAME} to carry out a short survey with local businesses. Are you the business owner?`;
   }
 
   function buildOwnerStatusFollowUpReply(memory) {
@@ -2040,7 +2091,7 @@ wss.on("connection", (ws) => {
         }
 
         // 3. Normal barge-in behaviour.
-        if (aiIsSpeaking) {
+        if (aiIsSpeaking && !awaitingScreenedCaller) {
           scheduleBargeIn(cleanTranscript);
         }
 
@@ -2074,6 +2125,18 @@ wss.on("connection", (ws) => {
         if (!finalTranscript) {
           startSilenceTimer();
           return;
+        }
+
+        if (awaitingScreenedCaller) {
+          if (isCallScreeningFollowUp(finalTranscript)) {
+            console.log("Waiting for screened caller:", finalTranscript);
+            addTranscriptLine("system", `Call screening announcement: ${finalTranscript}`);
+            return;
+          }
+
+          finishCallScreeningWait();
+          console.log("Call screening finished; recipient has spoken");
+          addTranscriptLine("system", "Call screening finished; recipient has spoken");
         }
 
         const processedAt = Date.now();
@@ -2197,6 +2260,7 @@ wss.on("connection", (ws) => {
 
       if (data.event === "stop") {
         callIsEnding = true;
+        finishCallScreeningWait();
         responseGenerationId++;
         cancelActiveAudioTracking();
         clearIntroTimer();
@@ -2226,6 +2290,7 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     callIsEnding = true;
+    finishCallScreeningWait();
     responseGenerationId++;
     cancelActiveAudioTracking();
     clearIntroTimer();
@@ -2247,6 +2312,7 @@ wss.on("connection", (ws) => {
 
   ws.on("error", (error) => {
     callIsEnding = true;
+    finishCallScreeningWait();
     responseGenerationId++;
     cancelActiveAudioTracking();
     clearIntroTimer();

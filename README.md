@@ -16,6 +16,22 @@ An incomplete enquiry answer such as "times" prompts for "yes, no, or sometimes"
 Complete frequency answers such as "two times" and "twice a week" are retained.
 Unclear speech is not automatically treated as consent or a website duration.
 
+## iPhone call screening
+
+After detecting a request for the caller's name and reason for calling, Lily
+answers once and waits quietly for the recipient. Screening acknowledgements
+such as "Thanks" and "Please stay on the line" are recorded as system events
+and do not advance the survey. The normal silence check is suspended during
+this wait; a completed response other than a recognised screening announcement
+resumes the survey and its normal silence handling. Voicemail is still handled
+if the screened call goes to an answering machine.
+
+`CALL_SCREENING_WAIT_TIMEOUT_MS` sets the maximum wait from screening detection
+(default `60000`, in milliseconds). Repeated announcements do not extend it.
+If no recipient responds before this deadline, the call ends with the reason
+"Call screening timed out waiting for the recipient". `CALL_SCREENING_MESSAGE`
+continues to control Lily's screening introduction.
+
 ## Deepgram configuration
 
 Keep your existing `DEEPGRAM_API_KEY` in the environment or `.env`. No new
