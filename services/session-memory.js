@@ -2,6 +2,7 @@
 
 const {
   formatCustomerAddress,
+  inferQuestionKeyFromAssistantReply,
   isFinancialAuthorityPrompt,
 } = require("./survey-script");
 
@@ -12,6 +13,8 @@ function createSessionMemory() {
     correctBusinessConfirmed: null,
     businessDetailsConfirmed: null,
     addressConfirmed: null,
+    addressCorrectionConfirmed: false,
+    businessDetailsCorrectionConfirmed: false,
     businessName: null,
     businessAddress: null,
     postcode: null,
@@ -246,14 +249,14 @@ function extractBusinessName(text) {
 }
 
 function normaliseBusinessNameAnswer(text) {
-  return stripLeadingPhrase(text, [
+  return stripLeadingPhrase(stripDetailAnswerPrefix(text), [
     /^(?:yes|yeah|yep|yeh|okay|ok|right|correct)[,.\s-]+/i,
     /^(?:it is|it's|this is)[,.\s-]+/i,
   ]);
 }
 
 function normaliseBusinessAddressAnswer(text) {
-  return stripLeadingPhrase(text, [
+  return stripLeadingPhrase(stripDetailAnswerPrefix(text), [
     /^(?:it is|it's|this is)[,.\s-]+/i,
     /^(?:the address is|our address is|we are at|we're at)[,.\s-]+/i,
   ]);
@@ -623,24 +626,116 @@ function normaliseDecisionMakerRole(text) {
   return extractRole(text);
 }
 
-function looksLikeAddressCorrection(text) {
-  if (extractUkPostcode(text)) {
-    return true;
-  }
-
-  const candidate = normaliseBusinessAddressAnswer(text);
-
-  return Boolean(candidate && candidate.split(/\s+/).length >= 3);
+function isDetailRejection(text) {
+  return isNegativeAnswer(text) ||
+    /\b(?:wrong|incorrect|not (?:right|correct)|isn't (?:right|correct)|is not (?:right|correct))\b/i.test(text);
 }
 
-function looksLikeBusinessDetailCorrection(text) {
-  if (extractBusinessName(text) || extractPhoneNumber(text)) {
-    return true;
+function stripDetailAnswerPrefix(text) {
+  return cleanValue(text).replace(
+    /^(?:(?:oh|ah|sorry|actually|no|nope|nah|yes|yeah|yep|(?:that is|that's|it is|it's) (?:wrong|incorrect|not right|not correct))[,.!\s-]+)+/i,
+    ""
+  );
+}
+
+function isUsableDetailAnswer(text) {
+  const candidate = cleanValue(text);
+  return Boolean(candidate && !isDetailRejection(candidate) &&
+    !isAffirmativeAnswer(candidate) && !candidate.includes("?") &&
+    !/^(?:oh|ah|um|erm|sorry|actually|hello|hi|here|i'm here|i am here|thanks|thank you|i don't know|i do not know)$/i.test(candidate) &&
+    !/^(?:what|why|how|can you|could you|would you)\b/i.test(candidate));
+}
+
+function extractAddressCorrection(text, allowFreeform = false) {
+  const candidate = normaliseBusinessAddressAnswer(text)
+    .replace(/\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b/gi, "")
+    .replace(/(?:[,;\s]+)?(?:and\s+)?(?:the\s+)?(?:postcode|post code)(?:\s+is)?[,.\s]*.*$/i, "");
+  const address = cleanValue(candidate);
+
+  if (!isUsableDetailAnswer(address) || extractUkPostcode(address)) {
+    return null;
   }
 
-  const candidate = normaliseBusinessNameAnswer(text);
+  return allowFreeform || /\d.*[a-z]|\b(?:road|street|lane|avenue|drive|close|court|way|terrace|place|cottage|house|farm|lodge)\b/i.test(address)
+    ? address : null;
+}
 
-  return Boolean(candidate && candidate.split(/\s+/).length >= 2);
+function extractBusinessDetailName(text, allowFreeform = false) {
+  const nameText = cleanValue(text)
+    .replace(/(?:[,;\s]+)?(?:and\s+)?(?:the\s+|our\s+)?(?:business\s+)?(?:phone(?: number)?|telephone(?: number)?|number|mobile(?: number)?)\s+(?:is|as)\b.*$/i, "")
+    .replace(/\+?\d[\d ()-]{5,}\d.*$/, "")
+    .replace(/[,;\s]+and\s*$/i, "");
+  const explicitName = extractBusinessName(nameText);
+  const candidate = explicitName || normaliseBusinessNameAnswer(nameText);
+
+  return isUsableDetailAnswer(candidate) && (explicitName || allowFreeform)
+    ? cleanValue(candidate) : null;
+}
+
+const BUSINESS_DETAIL_PROMPTS = new Set([
+  "address_confirmation", "address_correction_confirmation", "business_address", "postcode",
+  "business_details_confirmation", "business_details_correction_confirmation", "business_name", "business_phone",
+]);
+
+function updateBusinessDetails(memory, text, promptKey, customer, changedFields) {
+  const addressPrompt = ["address_confirmation", "address_correction_confirmation", "business_address", "postcode"].includes(promptKey);
+  const originalConfirmation = promptKey === "address_confirmation" || promptKey === "business_details_confirmation";
+  const correctionConfirmation = promptKey === "address_correction_confirmation" || promptKey === "business_details_correction_confirmation";
+  const confirmation = originalConfirmation || correctionConfirmation;
+  const answerField = addressPrompt ? "addressConfirmed" : "businessDetailsConfirmed";
+  const correctionField = addressPrompt ? "addressCorrectionConfirmed" : "businessDetailsCorrectionConfirmed";
+  const valueFields = addressPrompt ? ["businessAddress", "postcode"] : ["businessName", "phoneNumber"];
+  const rejected = isDetailRejection(text);
+  const affirmative = !rejected && isAffirmativeAnswer(text);
+  const postcode = addressPrompt ? extractUkPostcode(text) : null;
+  const address = addressPrompt && promptKey !== "postcode"
+    ? extractAddressCorrection(text, promptKey === "business_address") : null;
+  const phone = !addressPrompt ? extractPhoneNumber(text) : null;
+  const name = !addressPrompt && promptKey !== "business_phone"
+    ? extractBusinessDetailName(text, promptKey === "business_name" || !phone) : null;
+  const replacements = addressPrompt ? [address, postcode] : [name, phone];
+  const hasReplacement = replacements.some(Boolean);
+  const knownValues = addressPrompt
+    ? [customer.address || formatCustomerAddress(customer), customer.postcode]
+    : [customer.businessName, customer.phoneNumber];
+  const confirmationValues = correctionConfirmation
+    ? valueFields.map((field) => memory[field]) : knownValues;
+  const comparableValue = (value) => compactText(value).replace(/[^a-z0-9]/g, "");
+  const hasChangedReplacement = replacements.some((value, index) =>
+    value && comparableValue(value) !== comparableValue(confirmationValues[index])
+  );
+
+  if (confirmation && (rejected || (hasReplacement && (!affirmative || hasChangedReplacement)))) {
+    setField(memory, answerField, "no", changedFields);
+    setField(memory, correctionField, false, changedFields);
+    // A rejected pair must be collected again; never reuse the rejected profile values.
+    for (const field of valueFields) {
+      clearField(memory, field, changedFields);
+    }
+  } else if (confirmation && affirmative) {
+    if (correctionConfirmation) {
+      if (valueFields.every((field) => memory[field])) {
+        setField(memory, correctionField, true, changedFields);
+        if (memory[answerField] !== "no") {
+          setField(memory, answerField, "yes", changedFields);
+        }
+      }
+    } else {
+      setField(memory, answerField, "yes", changedFields);
+      valueFields.forEach((field, index) => setField(memory, field, knownValues[index], changedFields));
+    }
+    if (!addressPrompt && !memory.wrongNumber) {
+      setField(memory, "correctBusinessConfirmed", "yes", changedFields);
+    }
+    return;
+  }
+
+  replacements.forEach((value, index) => {
+    if (value) {
+      setField(memory, valueFields[index], value, changedFields);
+      setField(memory, correctionField, false, changedFields);
+    }
+  });
 }
 
 function isLowConfidenceIndustry(text) {
@@ -821,18 +916,15 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   const speechText = normaliseSpeechText(questionRawText || rawText);
   const lower = rawText.toLowerCase();
   const questionLower = questionRawText.toLowerCase();
-  const promptKey = cleanValue(context.promptKey).toLowerCase();
   const lastAssistant = getLastAssistantMessage(context.conversationHistory || [], {
     preferredPromptText: context.promptText,
     skipGenericPresenceChecks: true,
   });
+  const promptKey = cleanValue(context.promptKey).toLowerCase() ||
+    inferQuestionKeyFromAssistantReply(lastAssistant);
   const lastAssistantLower = lastAssistant.toLowerCase();
   const callProfile = context.callProfile || {};
   const callProfileCustomer = callProfile.customer || {};
-  const knownBusinessAddressLine = cleanValue(callProfileCustomer.address);
-  const knownBusinessAddress = formatCustomerAddress(callProfileCustomer);
-  const knownPostcode = cleanValue(callProfileCustomer.postcode);
-  const knownBusinessName = cleanValue(callProfileCustomer.businessName);
   const knownBusinessPhone = cleanValue(
     callProfileCustomer.phoneNumber || callProfile.to
   );
@@ -901,6 +993,23 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
   ) {
     setField(memory, "notInterested", true, changedFields);
     setField(memory, "interestInMoreEnquiries", "no", changedFields);
+  }
+
+  if (BUSINESS_DETAIL_PROMPTS.has(promptKey)) {
+    if (!memory.wrongNumber && !memory.doNotCall && !memory.busy && !memory.notInterested) {
+      updateBusinessDetails(memory, questionRawText, promptKey, {
+        ...callProfileCustomer,
+        phoneNumber: knownBusinessPhone,
+      }, changedFields);
+    }
+    if (memory.busy) {
+      setField(memory, "callbackDate", extractDateLikeText(questionRawText), changedFields);
+      setField(memory, "callbackTime", normaliseCallbackTimeAnswer(questionRawText), changedFields);
+    }
+    if (changedFields.length) {
+      memory.lastUpdatedAt = new Date().toISOString();
+    }
+    return { changedFields, memory };
   }
 
   const assistantAskedContactName = promptMatches(
@@ -988,28 +1097,6 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
 
   const assistantAskedFinancialAuthorityByPrompt =
     assistantAskedFinancialAuthority || isFinancialAuthorityPrompt(lastAssistantLower);
-
-  const assistantAskedAddressConfirmation = promptMatches(
-    promptKey,
-    "address_confirmation",
-    lastAssistantLower,
-    [
-      "confirm that your address is",
-      "confirm your address is",
-      "confirm that the postcode is",
-    ]
-  );
-
-  const assistantAskedBusinessDetailsConfirmation = promptMatches(
-    promptKey,
-    "business_details_confirmation",
-    lastAssistantLower,
-    [
-      "business name as",
-      "business number as",
-      "business number",
-    ]
-  );
 
   const assistantAskedDecisionMakerName = promptMatches(
     promptKey,
@@ -1187,127 +1274,6 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
 
   if (postcode) {
     setField(memory, "postcode", postcode, changedFields);
-  }
-
-  if (assistantAskedAddressConfirmation) {
-    if (isNegativeAnswer(questionRawText)) {
-      setField(memory, "addressConfirmed", "no", changedFields);
-
-      if (looksLikeAddressCorrection(questionRawText)) {
-        if (postcode) {
-          setField(memory, "postcode", postcode, changedFields);
-        }
-
-        const correctedAddress = normaliseBusinessAddressAnswer(questionRawText);
-
-        if (correctedAddress) {
-          setField(memory, "businessAddress", correctedAddress, changedFields);
-        }
-      } else if (shouldStoreRawAnswer(questionRawText)) {
-        pushNote(memory, `Address correction: ${questionRawText}`, changedFields);
-      }
-    } else if (isAffirmativeAnswer(questionRawText)) {
-      setField(memory, "addressConfirmed", "yes", changedFields);
-
-      if (knownBusinessAddressLine || knownBusinessAddress) {
-        setField(
-          memory,
-          "businessAddress",
-          knownBusinessAddressLine || knownBusinessAddress,
-          changedFields
-        );
-      }
-
-      if (knownPostcode) {
-        setField(memory, "postcode", knownPostcode, changedFields);
-      }
-    } else if (looksLikeAddressCorrection(questionRawText)) {
-      setField(memory, "addressConfirmed", "no", changedFields);
-
-      if (postcode) {
-        setField(memory, "postcode", postcode, changedFields);
-      }
-
-      if (shouldStoreRawAnswer(questionRawText)) {
-        setField(
-          memory,
-          "businessAddress",
-          normaliseBusinessAddressAnswer(questionRawText),
-          changedFields
-        );
-      }
-    }
-  }
-
-  if (
-    assistantAskedBusinessAddress &&
-    shouldStoreRawAnswer(questionRawText) &&
-    !memory.wrongNumber
-  ) {
-    setField(
-      memory,
-      "businessAddress",
-      normaliseBusinessAddressAnswer(questionRawText),
-      changedFields
-    );
-    setField(memory, "correctBusinessConfirmed", "yes", changedFields);
-  }
-
-  if (assistantAskedPostcode && shouldStoreRawAnswer(questionRawText)) {
-    setField(memory, "postcode", postcode || questionRawText, changedFields);
-  }
-
-  if (assistantAskedBusinessDetailsConfirmation) {
-    if (isNegativeAnswer(questionRawText)) {
-      setField(memory, "businessDetailsConfirmed", "no", changedFields);
-
-      if (looksLikeBusinessDetailCorrection(questionRawText)) {
-        const correctedBusinessName =
-          extractBusinessName(questionRawText) ||
-          normaliseBusinessNameAnswer(questionRawText);
-        const correctedPhoneNumber = extractPhoneNumber(questionRawText);
-
-        if (correctedBusinessName) {
-          setField(memory, "businessName", correctedBusinessName, changedFields);
-        }
-
-        if (correctedPhoneNumber) {
-          setField(memory, "phoneNumber", correctedPhoneNumber, changedFields);
-        }
-      } else if (shouldStoreRawAnswer(questionRawText)) {
-        pushNote(
-          memory,
-          `Business detail correction: ${questionRawText}`,
-          changedFields
-        );
-      }
-    } else if (isAffirmativeAnswer(questionRawText)) {
-      setField(memory, "businessDetailsConfirmed", "yes", changedFields);
-      setField(memory, "correctBusinessConfirmed", "yes", changedFields);
-
-      if (knownBusinessName) {
-        setField(memory, "businessName", knownBusinessName, changedFields);
-      }
-
-      if (knownBusinessPhone) {
-        setField(memory, "phoneNumber", knownBusinessPhone, changedFields);
-      }
-    } else if (looksLikeBusinessDetailCorrection(questionRawText)) {
-      setField(memory, "businessDetailsConfirmed", "no", changedFields);
-
-      const correctedBusinessName =
-        extractBusinessName(questionRawText) ||
-        normaliseBusinessNameAnswer(questionRawText);
-      const correctedPhoneNumber = extractPhoneNumber(questionRawText);
-
-      if (correctedBusinessName) {
-        setField(memory, "businessName", correctedBusinessName, changedFields);
-      }
-
-      if (correctedPhoneNumber) {
-        setField(memory, "phoneNumber", correctedPhoneNumber, changedFields);
-      }
-    }
   }
 
   if (assistantAskedOwnerStatus) {
@@ -1679,6 +1645,8 @@ function formatSessionMemoryForPrompt(memory) {
     `Correct business confirmed: ${formatValue(memory.correctBusinessConfirmed)}`,
     `Business details confirmed: ${formatValue(memory.businessDetailsConfirmed)}`,
     `Address confirmed: ${formatValue(memory.addressConfirmed)}`,
+    `Corrected address confirmed: ${formatValue(memory.addressCorrectionConfirmed)}`,
+    `Corrected business details confirmed: ${formatValue(memory.businessDetailsCorrectionConfirmed)}`,
     `Business name: ${formatValue(memory.businessName)}`,
     `Business address: ${formatValue(memory.businessAddress)}`,
     `Postcode: ${formatValue(memory.postcode)}`,
@@ -1713,6 +1681,8 @@ function formatSessionMemoryForLog(memory) {
     correctBusinessConfirmed: memory.correctBusinessConfirmed,
     businessDetailsConfirmed: memory.businessDetailsConfirmed,
     addressConfirmed: memory.addressConfirmed,
+    addressCorrectionConfirmed: memory.addressCorrectionConfirmed,
+    businessDetailsCorrectionConfirmed: memory.businessDetailsCorrectionConfirmed,
     businessName: memory.businessName,
     businessAddress: memory.businessAddress,
     postcode: memory.postcode,

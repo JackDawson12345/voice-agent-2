@@ -765,11 +765,17 @@ wss.on("connection", (ws) => {
 
     const profile = context.callProfile || getCurrentCallProfile();
     const profileCustomer = profile.customer || {};
-    const finalCustomerAddress = sessionMemory.businessAddress || formatCustomerAddress(profileCustomer);
-    const finalPostcode = sessionMemory.postcode || profileCustomer.postcode || null;
-    const finalBusinessName = sessionMemory.businessName || profileCustomer.businessName || null;
+    const addressRejected = sessionMemory.addressConfirmed === "no";
+    const businessDetailsRejected = sessionMemory.businessDetailsConfirmed === "no";
+    const finalCustomerAddress = sessionMemory.businessAddress ||
+      (addressRejected ? null : formatCustomerAddress(profileCustomer));
+    const finalPostcode = sessionMemory.postcode ||
+      (addressRejected ? null : profileCustomer.postcode) || null;
+    const finalBusinessName = sessionMemory.businessName ||
+      (businessDetailsRejected ? null : profileCustomer.businessName) || null;
     const finalPhoneNumber =
-      sessionMemory.phoneNumber || profileCustomer.phoneNumber || context.to;
+      sessionMemory.phoneNumber ||
+      (businessDetailsRejected ? null : profileCustomer.phoneNumber || context.to);
     const finalContactName = sessionMemory.contactName || profileCustomer.name || null;
     const finalContactTitle =
       sessionMemory.contactTitle || profileCustomer.title || null;
@@ -790,9 +796,9 @@ wss.on("connection", (ws) => {
         name: finalContactName,
         business_name: finalBusinessName,
         phone_number: finalPhoneNumber,
-        address: sessionMemory.businessAddress || profileCustomer.address || null,
-        town: profileCustomer.town || null,
-        county: profileCustomer.county || null,
+        address: sessionMemory.businessAddress || (addressRejected ? null : profileCustomer.address) || null,
+        town: addressRejected ? null : profileCustomer.town || null,
+        county: addressRejected ? null : profileCustomer.county || null,
         postcode: finalPostcode,
       },
       survey: {
@@ -801,6 +807,8 @@ wss.on("connection", (ws) => {
         decision_maker: sessionMemory.isDecisionMaker,
         address_confirmed: sessionMemory.addressConfirmed,
         business_details_confirmed: sessionMemory.businessDetailsConfirmed,
+        address_correction_confirmed: sessionMemory.addressCorrectionConfirmed,
+        business_details_correction_confirmed: sessionMemory.businessDetailsCorrectionConfirmed,
         current_website: sessionMemory.websiteStatus,
         website_age: sessionMemory.websiteAge,
         considered_website: sessionMemory.websiteInterestLevel,
@@ -822,6 +830,8 @@ wss.on("connection", (ws) => {
         postcode: finalPostcode,
         business_details_confirmed: sessionMemory.businessDetailsConfirmed,
         address_confirmed: sessionMemory.addressConfirmed,
+        address_correction_confirmed: sessionMemory.addressCorrectionConfirmed,
+        business_details_correction_confirmed: sessionMemory.businessDetailsCorrectionConfirmed,
         business_owner_status: sessionMemory.isBusinessOwner,
         authorised_decision_maker: sessionMemory.authorisedDecisionMaker,
         decision_maker_name: sessionMemory.decisionMakerName,

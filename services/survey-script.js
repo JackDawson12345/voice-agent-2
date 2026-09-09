@@ -231,6 +231,36 @@ function inferQuestionKeyFromAssistantReply(reply = "") {
     return "financial_authority";
   }
 
+  if (lower.includes("updated address is")) {
+    return "address_correction_confirmation";
+  }
+
+  if (lower.includes("updated business name is")) {
+    return "business_details_correction_confirmation";
+  }
+
+  if (
+    lower.includes("correct address for the business") ||
+    lower.includes("confirm the address for the business")
+  ) {
+    return "business_address";
+  }
+
+  if (lower.includes("postcode for that address")) {
+    return "postcode";
+  }
+
+  if (
+    lower.includes("correct business name") ||
+    lower.includes("confirm the business name for me")
+  ) {
+    return "business_name";
+  }
+
+  if (lower.includes("correct phone number for the business")) {
+    return "business_phone";
+  }
+
   if (
     lower.includes("confirm that your address is") ||
     lower.includes("confirm your address is") ||
@@ -306,11 +336,11 @@ function getScriptedNextQuestion(
   const companyName = options.companyName || "118 Online";
   const addressStepComplete = Boolean(
     memory.addressConfirmed === "yes" ||
-      (memory.businessAddress && memory.postcode)
+      memory.addressCorrectionConfirmed
   );
   const businessDetailsStepComplete = Boolean(
     memory.businessDetailsConfirmed === "yes" ||
-      (memory.businessName && (memory.phoneNumber || fallbackPhoneNumber))
+      memory.businessDetailsCorrectionConfirmed
   );
 
   if (memory.doNotCall || memory.wrongNumber) {
@@ -350,10 +380,34 @@ function getScriptedNextQuestion(
   }
 
   if (!addressStepComplete) {
+    if (memory.addressConfirmed === "no" || memory.businessAddress || memory.postcode) {
+      if (!memory.businessAddress) {
+        return "Could you confirm the correct address for the business?";
+      }
+
+      if (!memory.postcode) {
+        return "And what is the postcode for that address?";
+      }
+
+      return `Just to confirm, the updated address is ${memory.businessAddress} and the postcode is ${memory.postcode}, is that right?`;
+    }
+
     return buildAddressVerificationQuestion(customer);
   }
 
   if (!businessDetailsStepComplete) {
+    if (memory.businessDetailsConfirmed === "no" || memory.businessName) {
+      if (!memory.businessName) {
+        return "Could you confirm the correct business name?";
+      }
+
+      if (!memory.phoneNumber) {
+        return "And what is the correct phone number for the business?";
+      }
+
+      return `Just to confirm, the updated business name is ${memory.businessName} and the phone number is ${memory.phoneNumber}, is that right?`;
+    }
+
     return buildBusinessVerificationQuestion(customer, fallbackPhoneNumber);
   }
 
