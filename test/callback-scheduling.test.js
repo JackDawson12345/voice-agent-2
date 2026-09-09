@@ -1,7 +1,9 @@
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const { createSessionMemory, updateSessionMemoryFromTranscript } = require("../services/session-memory");
-const { getScriptedNextQuestion, inferQuestionKeyFromAssistantReply, hasCallbackSlot } = require("../services/survey-script");
+const { getScriptedNextQuestion, inferQuestionKeyFromAssistantReply, hasCallbackSlot,
+  buildCallbackConfirmationMessage } = require("../services/survey-script");
+const { callbackTimeMinutes } = require("../services/callback-time");
 
 function schedulingMemory(fields = {}) {
   return Object.assign(createSessionMemory(), {
@@ -149,5 +151,110 @@ test("wrong-number and do-not-call responses still stop the day confirmation flo
     assert.equal(memory[field], true);
     assert.equal(getScriptedNextQuestion(memory), null);
     assert.equal(hasCallbackSlot(memory), false);
+  }
+});
+
+for (const text of ["Anytime.", "Any time", "Anytime is fine", "Any time works for me", "Whenever", "Whenever you like"]) {
+  test(`flexible availability completes the callback time: ${text}`, () => {
+    const memory = schedulingMemory({ callbackDate: "Friday", callbackTimeNeedsClarification: true });
+    answer(memory, text, "callback_time");
+    assert.equal(memory.callbackTime, "anytime");
+    assert.equal(memory.callbackTimeNeedsClarification, false);
+    assert.equal(hasCallbackSlot(memory), true);
+    assert.match(buildCallbackConfirmationMessage(memory), /Friday, anytime between 9am and 5pm/);
+    assert.equal(callbackTimeMinutes(memory.callbackTime), null, "Do not invent an hour for flexible availability");
+  });
+}
+
+test("anytime works in the non-decision-maker, busy and combined day/time flows", () => {
+  for (const fields of [{ busy: true }, { isBusinessOwner: "no", isDecisionMaker: "no", authorisedDecisionMaker: "no" }]) {
+    const memory = schedulingMemory(fields);
+    answer(memory, "Friday", "callback_day");
+    answer(memory, "Anytime", "callback_time");
+    assert.equal(hasCallbackSlot(memory), true);
+  }
+  for (const text of ["Friday anytime", "Any time on Friday", "Call me back Friday anytime"]) {
+    const memory = schedulingMemory();
+    answer(memory, text, "callback_day");
+    assert.equal(memory.callbackDate, "Friday");
+    assert.equal(memory.callbackTime, "anytime");
+    assert.equal(hasCallbackSlot(memory), true);
+  }
+});
+
+test("unrelated and restricted anytime answers do not book an unrestricted callback", () => {
+  const unrelated = createSessionMemory();
+  updateSessionMemoryFromTranscript(unrelated, "Anytime", { promptKey: "industry" });
+  assert.equal(unrelated.callbackTime, null);
+  assert.equal(unrelated.callbackRequested, null);
+  for (const text of ["Not anytime", "Anytime after 5pm", "Any time before nine", "Anytime Friday morning", "Anytime except lunchtime", "Anytime but Friday"]) {
+    const memory = schedulingMemory({ callbackDate: "Friday" });
+    answer(memory, text, "callback_time");
+    assert.equal(memory.callbackTime, null, text);
+    assert.equal(hasCallbackSlot(memory), false, text);
+  }
+});
+
+for (const [text, expected] of [
+  ["3pm", 900], ["3p.m.", 900], ["3 p m", 900], ["Three P.M.", 900],
+  ["Friday at 3p.m.", 900], ["3.30pm", 930], ["3 30 PM", 930],
+  ["Three thirty PM", 930], ["Three forty-five PM", 945], ["Three oh five PM", 905],
+  ["Ten fifteen AM", 615], ["15 30", 930], ["At three thirty in the afternoon", 930],
+]) {
+  test(`time transcription preserves the full hour and minutes: ${text}`, () => {
+    const memory = schedulingMemory({ callbackDate: "Friday" });
+    answer(memory, text, "callback_time");
+    assert.equal(callbackTimeMinutes(memory.callbackTime), expected, memory.callbackTime);
+    assert.equal(hasCallbackSlot(memory), true);
+  });
+}
+
+test("a missing hour asks a targeted question, then combines the answer with the heard PM", () => {
+  const memory = schedulingMemory({ callbackDate: "Friday" });
+  answer(memory, "PM.", "callback_time");
+  assert.equal(memory.callbackTime, null);
+  assert.equal(memory.pendingCallbackMeridiem, "pm");
+  assert.equal(hasCallbackSlot(memory), false);
+  assert.match(getScriptedNextQuestion(memory), /only caught PM.*say the hour/);
+  answer(memory, "Three", "callback_time");
+  assert.equal(callbackTimeMinutes(memory.callbackTime), 900);
+  assert.equal(memory.pendingCallbackMeridiem, null);
+  assert.equal(memory.callbackTimeNeedsClarification, false);
+  assert.equal(hasCallbackSlot(memory), true);
+});
+
+test("missing AM is retained without turning three AM into a daytime booking", () => {
+  const memory = schedulingMemory({ callbackDate: "Friday" });
+  answer(memory, "A.M.", "callback_time");
+  answer(memory, "Three", "callback_time");
+  assert.equal(memory.callbackTime, null);
+  assert.equal(hasCallbackSlot(memory), false);
+  answer(memory, "Anytime", "callback_time");
+  assert.equal(memory.callbackTime, "anytime");
+  assert.equal(memory.pendingCallbackMeridiem, null);
+});
+
+test("a full replacement or refusal clears a pending meridiem", () => {
+  for (const replacement of ["10 AM", "Anytime", "I don't want a callback"]) {
+    const memory = schedulingMemory({ callbackDate: "Friday" });
+    answer(memory, "PM", "callback_time");
+    answer(memory, replacement, "callback_time");
+    assert.equal(memory.pendingCallbackMeridiem, null);
+    assert.equal(memory.callbackTimeNeedsClarification, false);
+    assert.equal(hasCallbackSlot(memory), replacement !== "I don't want a callback");
+  }
+});
+
+test("a missing meridiem's hour answer can include minutes or an explicit 24-hour replacement", () => {
+  for (const [period, time, expected] of [
+    ["AM", "Ten thirty", 630], ["AM", "Three thirty", null],
+    ["PM", "Quarter past three", 915], ["PM", "13:30", 810],
+  ]) {
+    const memory = schedulingMemory({ callbackDate: "Friday" });
+    answer(memory, period, "callback_time");
+    answer(memory, time, "callback_time");
+    assert.equal(callbackTimeMinutes(memory.callbackTime), expected, `${period} then ${time}`);
+    assert.equal(hasCallbackSlot(memory), expected !== null);
+    assert.equal(memory.pendingCallbackMeridiem, null);
   }
 });

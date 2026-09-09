@@ -62,7 +62,8 @@ test("Flux uses listen v2, Twilio audio, and individually encoded terminology hi
   for (const day of ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]) {
     assert.ok(hints.includes(day), `Missing weekday hint: ${day}`);
   }
-  for (const term of ["years", "months", "Whinfell Drive", "Normanby", "Example & Sons", "Middlesbrough"]) {
+  for (const term of ["years", "months", "Whinfell Drive", "Normanby", "Example & Sons", "Middlesbrough",
+    "anytime", "nine am", "three pm", "five pm", "half past", "quarter to"]) {
     assert.ok(hints.includes(term), term);
   }
   assert.equal(hints.filter((term) => term === "years").length, 1);

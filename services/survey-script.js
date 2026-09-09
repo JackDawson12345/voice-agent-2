@@ -1,4 +1,4 @@
-const { isCallbackTimeWithinHours } = require("./callback-time");
+const { isCallbackTimeWithinHours, isAnytimeCallbackTime } = require("./callback-time");
 
 function cleanText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
@@ -195,7 +195,9 @@ function buildCallbackConfirmationMessage(memory = {}) {
 
   let slotText = `${date} at ${time}`;
 
-  if (
+  if (isAnytimeCallbackTime(time)) {
+    slotText = `${date}, anytime between 9am and 5pm`;
+  } else if (
     lowerTime === "morning" ||
     lowerTime === "afternoon" ||
     lowerTime === "evening"
@@ -383,7 +385,10 @@ function getScriptedNextQuestion(
   }
 
   if (memory.callbackTimeNeedsClarification) {
-    return "Please choose a specific time between 9am and 5pm. What time would suit you best?";
+    if (memory.pendingCallbackMeridiem) {
+      return `Sorry, I only caught ${memory.pendingCallbackMeridiem.toUpperCase()}. What time would suit you best? Please say the hour as well, or say anytime between 9am and 5pm.`;
+    }
+    return "Please choose a specific time between 9am and 5pm, or say anytime. What time would suit you best?";
   }
 
   if (memory.busy) {

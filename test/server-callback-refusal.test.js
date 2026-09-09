@@ -100,6 +100,27 @@ for (const scenario of [
     answers: ["Jack speaking.", "No. I'm not.", "No. I'm not.", "No. Thank you."],
     websiteAge: null,
   },
+  ...[
+    { text: "Anytime.", savedTime: "anytime", confirmation: /Friday, anytime between 9am and 5pm/ },
+    { text: "3pm.", savedTime: "3 pm", confirmation: /Friday at 3 pm/ },
+    { text: "Three thirty PM.", savedTime: "3:30 pm", confirmation: /Friday at 3:30 pm/ },
+    { text: "Three", savedTime: "three pm", confirmation: /Friday at three pm/, missingHour: true },
+  ].map(({ text, savedTime, confirmation, missingHour }) => ({
+    name: `Flux books the non-decision-maker callback and saves the time: ${missingHour ? "PM then " : ""}${text}`,
+    flux: true,
+    callback: true,
+    savedTime,
+    answers: [
+      "Jack speaking.", "No. I'm not.", "No. I'm not.", "Yes.",
+      { text: "Friday.", expectedReply: /between 9am and 5pm/ },
+      ...(missingHour ? [
+        { text: "Three", event: "Update", expectReply: false },
+        { text: "PM.", expectedReply: /only caught PM.*say the hour/ },
+      ] : []),
+      { text, expectedReply: confirmation },
+    ],
+    websiteAge: null,
+  })),
   {
     name: "the server preserves a correction after a presence check and confirms a misheard duration",
     answers: [
@@ -313,7 +334,7 @@ test(scenario.name, async () => {
         clearCount, "An old interruption timer cleared the new reply");
     }
     if (expectedReply) assert.match(spoken.at(-1), expectedReply);
-    if (scenario.callback && text !== "10 AM") {
+    if (scenario.callback && !/arranged the callback/.test(spoken.at(-1))) {
       assert.ok([...timers.values()].every((timer) => timer.delay !== 1200), "Callback must not end before a valid time is supplied");
       assert.equal(results.length, 0);
     }
@@ -354,7 +375,9 @@ test(scenario.name, async () => {
     assert.equal(results[0].survey.callback_consent, "yes");
     assert.equal(results[0].survey.callback_requested, true);
     assert.equal(results[0].survey.callback_date, "Friday");
-    assert.equal(results[0].survey.callback_time, "10 am");
+    assert.equal(results[0].survey.callback_time, scenario.savedTime || "10 am");
+    assert.equal(results[0].lead.callback_time, scenario.savedTime || "10 am");
+    assert.equal(results[0].memory.callbackTime, scenario.savedTime || "10 am");
     assert.equal(results[0].memory.callbackConfirmed, true);
   } else {
     assert.equal(results[0].reason, "Callback declined");

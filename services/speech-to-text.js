@@ -28,7 +28,10 @@ function createSpeechToTextStream({ onTranscript, onOpen, onClose, onError, keyt
   const recognitionHints = [
     "website", "years", "months", "weeks", "postcode",
     "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
-    "today", "tomorrow", "morning", "afternoon",
+    "today", "tomorrow", "morning", "afternoon", "anytime",
+    "nine am", "ten am", "eleven am", "twelve pm", "noon",
+    "one pm", "two pm", "three pm", "four pm", "five pm",
+    "half past", "quarter past", "quarter to",
     ...keyterms,
     ...(process.env.DEEPGRAM_KEYTERMS || "").split(","),
   ];

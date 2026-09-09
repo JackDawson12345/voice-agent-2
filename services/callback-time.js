@@ -1,8 +1,34 @@
+const hours = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve"];
+
+function normaliseCallbackTimeText(value) {
+  const hourPattern = `(?:${hours.slice(1).join("|")}|\\d{1,2})`;
+  const units = "(?:one|two|three|four|five|six|seven|eight|nine)";
+  const minutes = `(?:(?:twenty|thirty|forty|fifty)(?:[ -]${units})?|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|(?:oh|zero)[ -]${units}|\\d{2})`;
+  return String(value || "").toLowerCase()
+    // Also accept attached/dotted forms such as "3p.m." and "3p m".
+    .replace(/(?<![a-z])([ap])\.?\s*m\.?(?![a-z])/g, "$1m")
+    .replace(/(\d)(am|pm)\b/g, "$1 $2")
+    .replace(/\b(\d{1,2})\.(\d{2})\b/g, "$1:$2")
+    .replace(new RegExp(`\\b(${hourPattern})\\s+(${minutes})\\b`, "g"), (_, hour, minute) => {
+      const parts = minute.split(/[ -]/);
+      const values = { oh: 0, zero: 0, ten: 10, eleven: 11, twelve: 12, thirteen: 13,
+        fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18,
+        nineteen: 19, twenty: 20, thirty: 30, forty: 40, fifty: 50 };
+      const count = parts.reduce((total, part) => total + (values[part] ??
+        (hours.includes(part) ? hours.indexOf(part) : Number(part))), 0);
+      return `${hours.includes(hour) ? hours.indexOf(hour) : hour}:${String(count).padStart(2, "0")}`;
+    })
+    .replace(/\s+/g, " ")
+    .replace(/^[\s,.;!?]+|[\s,.;!?]+$/g, "");
+}
+
+function isAnytimeCallbackTime(value) {
+  return /^any\s*time$/.test(normaliseCallbackTimeText(value));
+}
+
 // Callbacks use the business's local clock, from 9am through 5pm inclusive.
 function callbackTimeMinutes(value) {
-  const hours = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve"];
-  const text = String(value || "").toLowerCase()
-    .replace(/\b([ap])\.?\s*m\.?/g, "$1m")
+  const text = normaliseCallbackTimeText(value)
     .replace(/\bnoon\b/, "12 pm")
     .replace(/\bmidnight\b/, "12 am")
     .replace(/\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b/g, (word) => hours.indexOf(word))
@@ -26,6 +52,8 @@ function callbackTimeMinutes(value) {
 }
 
 function isCallbackTimeWithinHours(value) {
+  // "Anytime" retains the caller's flexibility across the offered window.
+  if (isAnytimeCallbackTime(value)) return true;
   const minutes = callbackTimeMinutes(value);
   return minutes !== null && minutes >= 9 * 60 && minutes <= 17 * 60;
 }
@@ -38,4 +66,5 @@ function formatCallbackClock(value) {
   return `${hour % 12 || 12}${minute ? `:${String(minute).padStart(2, "0")}` : ""} ${hour >= 12 ? "pm" : "am"}`;
 }
 
-module.exports = { callbackTimeMinutes, isCallbackTimeWithinHours, formatCallbackClock };
+module.exports = { callbackTimeMinutes, isCallbackTimeWithinHours, formatCallbackClock,
+  isAnytimeCallbackTime, normaliseCallbackTimeText };

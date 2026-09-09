@@ -65,12 +65,21 @@ Deepgram API key and incoming Twilio audio.
 
 ## Callback scheduling
 
-Weekday names are included in the recognition hints. When a callback-day answer
+Weekday names and spoken callback times (including "three pm" and "anytime")
+are included in the recognition hints. When a callback-day answer
 is transcribed as "Rider", the agent asks whether the caller meant Friday and
 waits for confirmation. Rejecting that suggestion asks for another day.
 
 All callback time questions offer 9am to 5pm in the business's local time.
-Out-of-hours answers, such as 10pm, and vague time windows require a specific
-replacement time before the callback is confirmed. Spoken hours, AM/PM and
-24-hour clock times are supported; a bare hour such as "three" in response to
-the time question is read back as 3pm within the offered window.
+"Anytime", "any time" and "whenever" are accepted as flexible availability.
+The call result retains `callback_time: "anytime"`, and the confirmation reads
+back the agreed day with "anytime between 9am and 5pm". No hour is invented.
+Out-of-hours answers, such as 10pm, and restricted or unclear time windows
+require a replacement time or an explicit anytime answer before confirmation.
+
+Spoken hours and minutes ("three thirty PM"), attached/dotted AM/PM ("3p.m."),
+and 24-hour clock times are supported; a bare hour such as "three" in response
+to the time question is read back as 3pm within the offered window. If the
+recogniser supplies only "PM" or "AM", the agent asks for the missing hour and
+retains that period for a follow-up hour. It does not guess numbers omitted by
+speech recognition or restore words removed from a final Flux transcript.
