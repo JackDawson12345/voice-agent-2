@@ -238,3 +238,98 @@ test("a callback request during detail correction still captures the day and tim
   assert.equal(call.memory.callbackTime, "10 am");
   assert.equal(call.memory.businessAddress, null);
 });
+
+for (const [spoken, expected] of [
+  ["Zero seven three six zero zero five zero seven nine zero.", "07360050790"],
+  ["Oh seven three six double oh five oh seven nine oh.", "07360050790"],
+  ["O seven three six double zero five zero seven nine zero.", "07360050790"],
+  ["Nought seven three six nought nought five nought seven nine nought.", "07360050790"],
+  ["It's 0736 double zero 5 zero 790.", "07360050790"],
+  ["Zero one six three two triple zero triple two.", "01632000222"],
+  ["Plus four four seven three six zero zero five zero seven nine zero.", "+447360050790"],
+  ["+44 (7360) 050-790", "+447360050790"],
+  ["07360.050790", "07360050790"],
+  ["Zero, seven, three, six. Zero zero, five, zero, seven nine zero.", "07360050790"],
+]) {
+  test(`spoken phone digits are saved and read back: ${spoken}`, () => {
+    const call = conversation({ addressConfirmed: "yes", contactName: "Jack" });
+    call.answer("No, the business name is New Dog Walking", "business_details_confirmation");
+    call.answer(spoken, "business_phone");
+    assert.equal(call.memory.phoneNumber, expected);
+    assert.equal(call.memory.businessName, "New Dog Walking");
+    assert.equal(call.memory.businessDetailsCorrectionConfirmed, false);
+    assert.ok(call.next().includes(expected));
+    call.answer("Yes.", "business_details_correction_confirmation");
+    assert.equal(call.memory.businessDetailsCorrectionConfirmed, true);
+    assert.equal(inferQuestionKeyFromAssistantReply(call.next()), "website_status");
+  });
+}
+
+for (const spoken of [
+  "Yes.", "You have that.", "Zero seven three six", "double double zero seven three six zero zero five zero seven nine zero",
+  "1234567890123456", "1234 people and 5678 orders", "01632000111 or 01632000222",
+]) {
+  test(`incomplete or ambiguous phone answers do not invent digits: ${spoken}`, () => {
+    const call = conversation({ addressConfirmed: "yes" });
+    call.answer("No, the business name is New Dog Walking", "business_details_confirmation");
+    call.answer(spoken, "business_phone");
+    assert.equal(call.memory.phoneNumber, null);
+    assert.equal(inferQuestionKeyFromAssistantReply(call.next()), "business_phone");
+  });
+}
+
+test("Says leaves the supplied business name and number intact until confirmed", () => {
+  const callProfile = { customer: { ...profile.customer, phoneNumber: "07360050790" } };
+  const call = conversation({ addressConfirmed: "yes", contactName: "Jack" }, callProfile);
+  for (const text of ["Says", "You have that.", "Zero seven three six zero zero five zero seven nine zero."]) {
+    call.answer(text, "business_details_confirmation");
+    assert.equal(call.memory.phoneNumber, "07360050790");
+    assert.equal(call.memory.businessName, null);
+    assert.equal(call.memory.businessDetailsConfirmed, null);
+    assert.equal(call.memory.lastUpdatedAt, null);
+    assert.ok(call.next().includes(profile.customer.businessName));
+  }
+  call.answer("Yes.", "business_details_confirmation");
+  assert.equal(call.memory.businessName, profile.customer.businessName);
+  assert.equal(call.memory.phoneNumber, "07360050790");
+  assert.equal(inferQuestionKeyFromAssistantReply(call.next()), "website_status");
+});
+
+test("an unclear correction confirmation cannot erase a captured phone number", () => {
+  const call = conversation({ addressConfirmed: "yes" });
+  call.answer("No, the business name is New Dog Walking", "business_details_confirmation");
+  call.answer("Zero seven three six double zero five zero seven nine zero", "business_phone");
+  call.answer("Says", "business_details_correction_confirmation");
+  assert.equal(call.memory.businessName, "New Dog Walking");
+  assert.equal(call.memory.phoneNumber, "07360050790");
+  assert.equal(call.memory.businessDetailsCorrectionConfirmed, false);
+  call.answer("Yes, zero seven three six double zero five zero seven nine zero", "business_details_correction_confirmation");
+  assert.equal(call.memory.businessDetailsCorrectionConfirmed, true);
+});
+
+test("a combined business correction separates the spoken phone from the name", () => {
+  const call = conversation({ addressConfirmed: "yes" });
+  call.answer("No, the business name is New Dog Walking and the phone number is zero seven three six double zero five zero seven nine zero.", "business_details_confirmation");
+  assert.equal(call.memory.businessName, "New Dog Walking");
+  assert.equal(call.memory.phoneNumber, "07360050790");
+  call.answer("Yes", "business_details_correction_confirmation");
+  assert.equal(call.memory.businessDetailsCorrectionConfirmed, true);
+});
+
+test("a spoken phone-only correction does not become a business name", () => {
+  const call = conversation({ addressConfirmed: "yes" });
+  call.answer("No, the number is zero seven three six double zero five zero seven nine zero", "business_details_confirmation");
+  assert.equal(call.memory.businessName, null);
+  assert.equal(call.memory.phoneNumber, "07360050790");
+  call.answer("New Dog Walking", "business_name");
+  call.answer("Yes", "business_details_correction_confirmation");
+  assert.equal(call.memory.businessDetailsCorrectionConfirmed, true);
+});
+
+test("explicitly named one-word businesses can still correct the known name", () => {
+  const call = conversation({ addressConfirmed: "yes" });
+  call.answer("The business name is Says", "business_details_confirmation");
+  assert.equal(call.memory.businessName, "Says");
+  assert.equal(call.memory.businessDetailsConfirmed, "no");
+  assert.equal(call.memory.phoneNumber, null);
+});

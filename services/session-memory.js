@@ -373,13 +373,52 @@ function extractRole(text) {
 }
 
 function extractPhoneNumber(text) {
-  const digits = String(text || "").replace(/[^\d+]/g, "");
+  const candidates = [];
+  let digits = "";
+  let prefix = "";
+  let start = null;
+  let repeat = 1;
+  let invalid = false;
+  const finishNumber = () => {
+    if (!invalid && repeat === 1 && digits.length >= 7 && digits.length <= 15) {
+      candidates.push({ number: prefix + digits, start });
+    }
+    digits = "";
+    prefix = "";
+    start = null;
+    repeat = 1;
+    invalid = false;
+  };
 
-  if (digits.length >= 7) {
-    return digits;
+  // Keep contiguous phone digits together, including spoken zero/oh, double
+  // and triple. Other words separate numbers so unrelated values are not joined.
+  for (const token of String(text || "").toLowerCase().matchAll(/[a-z]+|\d+|[^\s]/g)) {
+    const word = token[0];
+    if (/^[.,()\-]$/.test(word)) continue;
+    const digit = /^\d+$/.test(word) ? word
+      : word === "nought" ? "0" : normaliseSingleWordToken(word);
+
+    if (digit && /^\d+$/.test(digit)) {
+      if (start === null) start = token.index;
+      if (repeat !== 1 && digit.length !== 1) invalid = true;
+      digits += digit.repeat(repeat);
+      repeat = 1;
+    } else if (word === "double" || word === "triple") {
+      if (start === null) start = token.index;
+      if (repeat !== 1) invalid = true;
+      repeat = word === "double" ? 2 : 3;
+    } else if (word === "+" || word === "plus") {
+      if (start !== null) invalid = true;
+      start = token.index;
+      prefix = "+";
+    } else {
+      finishNumber();
+    }
   }
+  finishNumber();
 
-  return null;
+  // Multiple complete numbers need clarification rather than an arbitrary pick.
+  return candidates.length === 1 ? candidates[0] : null;
 }
 
 function normaliseHonorific(value) {
@@ -722,8 +761,8 @@ function extractAddressCorrection(text, allowFreeform = false) {
     ? address : null;
 }
 
-function extractBusinessDetailName(text, allowFreeform = false) {
-  const nameText = cleanValue(text)
+function extractBusinessDetailName(text, allowFreeform = false, phoneMatch = null) {
+  const nameText = cleanValue(phoneMatch ? text.slice(0, phoneMatch.start) : text)
     .replace(/(?:[,;\s]+)?(?:and\s+)?(?:the\s+|our\s+)?(?:business\s+)?(?:phone(?: number)?|telephone(?: number)?|number|mobile(?: number)?)\s+(?:is|as)\b.*$/i, "")
     .replace(/\+?\d[\d ()-]{5,}\d.*$/, "")
     .replace(/[,;\s]+and\s*$/i, "");
@@ -752,11 +791,14 @@ function updateBusinessDetails(memory, text, promptKey, customer, changedFields)
   const postcode = addressPrompt ? extractUkPostcode(text) : null;
   const address = addressPrompt && promptKey !== "postcode"
     ? extractAddressCorrection(text, promptKey === "business_address") : null;
-  const phone = !addressPrompt ? extractPhoneNumber(text) : null;
+  const phoneMatch = !addressPrompt ? extractPhoneNumber(text) : null;
+  const phone = phoneMatch?.number || null;
+  // A confirmation question is not a request for a freeform name. Require a
+  // correction cue before letting a fragment replace the name and clear the phone.
+  const namingCorrection = rejected || /\b(?:actually|instead|it is|it's|this is)\b/i.test(text);
   const name = !addressPrompt && promptKey !== "business_phone"
-    ? extractBusinessDetailName(text, promptKey === "business_name" || !phone) : null;
+    ? extractBusinessDetailName(text, promptKey === "business_name" || namingCorrection, phoneMatch) : null;
   const replacements = addressPrompt ? [address, postcode] : [name, phone];
-  const hasReplacement = replacements.some(Boolean);
   const knownValues = addressPrompt
     ? [customer.address || formatCustomerAddress(customer), customer.postcode]
     : [customer.businessName, customer.phoneNumber];
@@ -767,7 +809,7 @@ function updateBusinessDetails(memory, text, promptKey, customer, changedFields)
     value && comparableValue(value) !== comparableValue(confirmationValues[index])
   );
 
-  if (confirmation && (rejected || (hasReplacement && (!affirmative || hasChangedReplacement)))) {
+  if (confirmation && (rejected || hasChangedReplacement)) {
     setField(memory, answerField, "no", changedFields);
     setField(memory, correctionField, false, changedFields);
     // A rejected pair must be collected again; never reuse the rejected profile values.
@@ -789,6 +831,10 @@ function updateBusinessDetails(memory, text, promptKey, customer, changedFields)
     if (!addressPrompt && !memory.wrongNumber) {
       setField(memory, "correctBusinessConfirmed", "yes", changedFields);
     }
+    return;
+  } else if (confirmation) {
+    // Repeating an unchanged value or an unclear answer leaves the known pair
+    // intact. Ask for confirmation again without inventing a correction.
     return;
   }
 

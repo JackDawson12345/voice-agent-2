@@ -16,6 +16,12 @@ An incomplete enquiry answer such as "times" prompts for "yes, no, or sometimes"
 Complete frequency answers such as "two times" and "twice a week" are retained.
 Unclear speech is not automatically treated as consent or a website duration.
 
+Business phone numbers accept digit words, including "zero", "oh", "double"
+and "triple", as well as mixed spoken and numeric groups. Captured corrections
+are read back before the survey continues, and the normalized digits are sent
+in the call result. An unclear confirmation such as "Says" leaves the existing
+business details intact and asks for confirmation again.
+
 ## iPhone call screening
 
 After detecting a request for the caller's name and reason for calling, Lily

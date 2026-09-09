@@ -9,6 +9,36 @@ const surveyScript = require("../services/survey-script");
 // Exercise the server's real transcript, reply, playback-mark, hangup and
 // results paths, with all telephony/network services replaced by local fakes.
 for (const scenario of [
+  {
+    name: "Flux keeps the known number after Says and a spoken repetition, then posts it to Rails",
+    flux: true,
+    customer: { business_name: "Dawsons Dog Walking", phone_number: "07360050790" },
+    answers: [
+      "Jack speaking.", "Yes", "Yes",
+      { text: "Says", expectedReply: /^I have your business name as Dawsons Dog Walking and the business number as 07360050790/ },
+      { text: "Zero seven three six zero zero five zero seven nine zero.", expectedReply: /^I have your business name as Dawsons Dog Walking/ },
+      { text: "Yes.", expectedReply: /^Do you currently have a website/ },
+      "I don't want a callback",
+    ],
+    expectedPhone: "07360050790",
+    expectedBusiness: "Dawsons Dog Walking",
+    websiteAge: null,
+  },
+  {
+    name: "Flux saves a spoken phone correction, confirms it and posts the digits to Rails",
+    flux: true,
+    answers: [
+      "Jack speaking.", "Yes", "Yes", "No, the business name is New Business",
+      { text: "Zero seven three six", event: "Update", expectReply: false },
+      { text: "Zero seven three six zero zero five zero seven nine zero.", expectedReply: /updated business name is New Business and the phone number is 07360050790/ },
+      { text: "Yes.", expectedReply: /^Do you currently have a website/ },
+      "I don't want a callback",
+    ],
+    expectedPhone: "07360050790",
+    expectedBusiness: "New Business",
+    expectedPhoneCorrection: true,
+    websiteAge: null,
+  },
   ...["", "Yes"].map((interimText) => ({
     name: `a Flux turn starting during synthesis keeps its original question (initial text: ${interimText || "empty"})`,
     flux: true,
@@ -232,6 +262,7 @@ test(scenario.name, async () => {
     customer: {
       business_name: "Example Business", address: "100 Old Road",
       town: "Middlesbrough", postcode: "TS6 0DS",
+      ...scenario.customer,
     },
   } }, { json() {}, status() { return this; } });
   websocketServer.emit("connection", socket);
@@ -239,7 +270,7 @@ test(scenario.name, async () => {
     callSid: "CA-test-refusal", streamSid: "MZ-test-refusal",
   } }));
 
-  assert.ok(speechKeyterms.includes("Example Business"));
+  assert.ok(speechKeyterms.includes(scenario.customer?.business_name || "Example Business"));
   assert.ok(speechKeyterms.includes("Middlesbrough"));
   async function fireBargeInTimers() {
     for (const [id, timer] of [...timers]) {
@@ -335,6 +366,14 @@ test(scenario.name, async () => {
     assert.equal(results[0].memory.callbackConfirmed, false);
   }
   assert.equal(results[0].survey.website_age, scenario.websiteAge);
+  if (scenario.expectedPhone) {
+    assert.equal(results[0].memory.phoneNumber, scenario.expectedPhone);
+    assert.equal(results[0].customer.phone_number, scenario.expectedPhone);
+    assert.equal(results[0].lead.phone_number, scenario.expectedPhone);
+    assert.equal(results[0].customer.business_name, scenario.expectedBusiness);
+    assert.equal(results[0].survey.business_details_confirmed, scenario.expectedPhoneCorrection ? "no" : "yes");
+    assert.equal(results[0].survey.business_details_correction_confirmed, Boolean(scenario.expectedPhoneCorrection));
+  }
   if (scenario.noUnclearAge) {
     assert.ok(results[0].memory.notes.every((note) => !note.startsWith("Unclear website age")));
   }
