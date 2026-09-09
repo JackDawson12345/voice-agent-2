@@ -2029,7 +2029,9 @@ wss.on("connection", (ws) => {
           clearIntroTimer();
         }
 
-        if (isFinal && cleanTranscript) {
+        const isFluxTurn = raw?.type === "TurnInfo";
+
+        if (!isFluxTurn && isFinal && cleanTranscript) {
           storePendingCustomerSegment(cleanTranscript, raw);
         }
 
@@ -2037,11 +2039,16 @@ wss.on("connection", (ws) => {
           return;
         }
 
-        const finalTranscript = mergeTranscriptCandidates(
-          takePendingCustomerUtterance(cleanTranscript),
-          lastInterruptionTranscript
-        );
+        // Flux's EndOfTurn includes the whole answer. Merging an earlier
+        // interruption could reintroduce words corrected in the final result.
+        const finalTranscript = isFluxTurn
+          ? cleanTranscript
+          : mergeTranscriptCandidates(
+              takePendingCustomerUtterance(cleanTranscript),
+              lastInterruptionTranscript
+            );
 
+        resetPendingCustomerUtterance();
         lastInterruptionTranscript = "";
 
         if (!finalTranscript) {
@@ -2051,6 +2058,7 @@ wss.on("connection", (ws) => {
         const processedAt = Date.now();
 
         if (
+          !(isFluxTurn && Number.isInteger(raw.turn_index)) &&
           finalTranscript === lastFinalTranscript &&
           processedAt - lastFinalTranscriptAt < 1500
         ) {

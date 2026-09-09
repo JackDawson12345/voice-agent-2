@@ -2,10 +2,16 @@
 
 const WebSocket = require("ws");
 
+function readTurnSetting(name, fallback, min, max, integer = false) {
+  const value = Number(process.env[name] || fallback);
+  if (!Number.isFinite(value) || value < min || value > max || (integer && !Number.isInteger(value))) {
+    throw new Error(`${name} must be ${integer ? "an integer" : "a number"} between ${min} and ${max}`);
+  }
+  return String(value);
+}
+
 function createSpeechToTextStream({ onTranscript, onOpen, onClose, onError, keyterms = [] } = {}) {
   const apiKey = process.env.DEEPGRAM_API_KEY;
-  const endpointingMs = String(process.env.DEEPGRAM_ENDPOINTING_MS || "450");
-  const utteranceEndMs = String(process.env.DEEPGRAM_UTTERANCE_END_MS || "1000");
 
   if (!apiKey) {
     throw new Error("DEEPGRAM_API_KEY is missing from .env");
@@ -14,13 +20,9 @@ function createSpeechToTextStream({ onTranscript, onOpen, onClose, onError, keyt
   const params = new URLSearchParams({
     encoding: "mulaw",
     sample_rate: "8000",
-    channels: "1",
-    model: "nova-3",
-    language: "en-GB",
-    interim_results: "true",
-    punctuate: "true",
-    endpointing: endpointingMs,
-    utterance_end_ms: utteranceEndMs,
+    model: "flux-general-en",
+    eot_threshold: readTurnSetting("DEEPGRAM_EOT_THRESHOLD", "0.7", 0.5, 1),
+    eot_timeout_ms: readTurnSetting("DEEPGRAM_EOT_TIMEOUT_MS", "5000", 500, 60000, true),
   });
 
   const recognitionHints = [
@@ -37,7 +39,7 @@ function createSpeechToTextStream({ onTranscript, onOpen, onClose, onError, keyt
     }
   }
 
-  const deepgramUrl = `wss://api.deepgram.com/v1/listen?${params.toString()}`;
+  const deepgramUrl = `wss://api.deepgram.com/v2/listen?${params.toString()}`;
 
   const deepgramSocket = new WebSocket(deepgramUrl, {
     headers: {
@@ -46,18 +48,37 @@ function createSpeechToTextStream({ onTranscript, onOpen, onClose, onError, keyt
   });
 
   let isOpen = false;
+  let isClosed = false;
+  let lastCompletedTurnIndex = -1;
   const pendingAudio = [];
   let pendingAudioBytes = 0;
   let warnedAboutDroppedAudio = false;
   const maxPendingAudioBytes = 8000 * 5;
+  // Flux recommends 80 ms frames: 640 bytes of Twilio's 8 kHz mono mu-law.
+  const audioChunkBytes = 640;
+  let audioRemainder = Buffer.alloc(0);
+
+  function sendAudioChunks(audioBuffer) {
+    const audio = Buffer.concat([audioRemainder, audioBuffer]);
+    let offset = 0;
+    while (offset + audioChunkBytes <= audio.length) {
+      deepgramSocket.send(audio.subarray(offset, offset + audioChunkBytes));
+      offset += audioChunkBytes;
+    }
+    audioRemainder = Buffer.from(audio.subarray(offset));
+  }
 
   deepgramSocket.on("open", () => {
+    if (isClosed) {
+      deepgramSocket.close();
+      return;
+    }
     isOpen = true;
-    console.log("Deepgram speech-to-text connected");
+    console.log("Deepgram Flux speech-to-text connected");
 
     // Keep the start of an answer while the WebSocket handshake completes.
     for (const audioBuffer of pendingAudio) {
-      deepgramSocket.send(audioBuffer);
+      sendAudioChunks(audioBuffer);
     }
     pendingAudio.length = 0;
     pendingAudioBytes = 0;
@@ -68,38 +89,37 @@ function createSpeechToTextStream({ onTranscript, onOpen, onClose, onError, keyt
   });
 
   deepgramSocket.on("message", (message) => {
+    if (isClosed) return;
     try {
       const data = JSON.parse(message.toString());
 
-      if (data.type === "UtteranceEnd") {
-        if (onTranscript) {
-          onTranscript({
-            transcript: "",
-            isFinal: true,
-            speechFinal: true,
-            utteranceEnd: true,
-            raw: data,
-          });
-        }
-
+      if (data.type === "Error") {
+        const error = new Error(data.description || "Deepgram Flux returned an error");
+        error.code = data.code;
+        console.error("Deepgram Flux error:", error.code, error.message);
+        if (onError) onError(error);
         return;
       }
 
-      const transcript = data.channel?.alternatives?.[0]?.transcript || "";
+      if (data.type !== "TurnInfo") return;
 
-      if (!transcript && data.speech_final !== true) {
-        return;
+      const transcript = typeof data.transcript === "string" ? data.transcript : "";
+      const speechFinal = data.event === "EndOfTurn";
+      if (!transcript && !speechFinal) return;
+
+      // Flux sends the entire turn on each update, not separate final segments.
+      // EagerEndOfTurn and TurnResumed remain interim until EndOfTurn arrives.
+      if (Number.isInteger(data.turn_index)) {
+        if (data.turn_index <= lastCompletedTurnIndex) return;
+        if (speechFinal) lastCompletedTurnIndex = data.turn_index;
       }
-
-      const isFinal = data.is_final === true;
-      const speechFinal = data.speech_final === true;
 
       if (onTranscript) {
         onTranscript({
           transcript,
-          isFinal,
+          isFinal: speechFinal,
           speechFinal,
-          utteranceEnd: false,
+          utteranceEnd: speechFinal,
           raw: data,
         });
       }
@@ -118,9 +138,11 @@ function createSpeechToTextStream({ onTranscript, onOpen, onClose, onError, keyt
 
   deepgramSocket.on("close", () => {
     isOpen = false;
+    isClosed = true;
     pendingAudio.length = 0;
     pendingAudioBytes = 0;
-    console.log("Deepgram speech-to-text disconnected");
+    audioRemainder = Buffer.alloc(0);
+    console.log("Deepgram Flux speech-to-text disconnected");
 
     if (onClose) {
       onClose();
@@ -128,6 +150,7 @@ function createSpeechToTextStream({ onTranscript, onOpen, onClose, onError, keyt
   });
 
   function sendAudio(audioBuffer) {
+    if (isClosed) return;
     if (deepgramSocket.readyState === WebSocket.CONNECTING) {
       pendingAudio.push(audioBuffer);
       pendingAudioBytes += audioBuffer.length;
@@ -149,12 +172,19 @@ function createSpeechToTextStream({ onTranscript, onOpen, onClose, onError, keyt
       return;
     }
 
-    deepgramSocket.send(audioBuffer);
+    sendAudioChunks(audioBuffer);
   }
 
   function close() {
+    if (isClosed) return;
+    isClosed = true;
+    isOpen = false;
     pendingAudio.length = 0;
     pendingAudioBytes = 0;
+    if (deepgramSocket.readyState === WebSocket.OPEN && audioRemainder.length) {
+      deepgramSocket.send(audioRemainder);
+    }
+    audioRemainder = Buffer.alloc(0);
     if (
       deepgramSocket.readyState === WebSocket.OPEN ||
       deepgramSocket.readyState === WebSocket.CONNECTING

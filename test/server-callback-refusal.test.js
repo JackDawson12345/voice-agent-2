@@ -37,6 +37,22 @@ for (const scenario of [
     websiteAge: "Two years",
     identityClarification: true,
   },
+  {
+    name: "Flux turns drive the survey once per answer and keep repeated yes answers",
+    flux: true,
+    answers: [
+      "Jack speaking.", "Yes", "Yes", "Yes", "Yes",
+      { text: "Two", event: "StartOfTurn", expectReply: false },
+      { text: "Two yes", event: "Update", expectReply: false },
+      { text: "Two yes", event: "EagerEndOfTurn", expectReply: false },
+      { text: "Two years", event: "TurnResumed", expectReply: false },
+      { text: "Two years.", event: "EndOfTurn" },
+      { text: "Two years.", event: "EndOfTurn", turnIndex: 5, expectReply: false },
+      "Who is this?", "I don't want a callback",
+    ],
+    websiteAge: "Two years",
+    identityClarification: true,
+  },
 ]) {
 test(scenario.name, async () => {
   const routes = new Map();
@@ -50,6 +66,9 @@ test(scenario.name, async () => {
   let now = Date.now();
   let onTranscript;
   let speechKeyterms;
+  let fluxSocket;
+  let transcriptCompletion;
+  let turnIndex = 0;
   let websocketServer;
   const app = {
     use() {}, get() {}, all() {},
@@ -78,6 +97,28 @@ test(scenario.name, async () => {
       createSpeechToTextStream: (options) => {
         onTranscript = options.onTranscript;
         speechKeyterms = options.keyterms;
+        if (scenario.flux) {
+          class FluxWebSocket extends EventEmitter {
+            static CONNECTING = 0;
+            static OPEN = 1;
+            constructor() { super(); this.readyState = 1; fluxSocket = this; }
+            send() {}
+            close() { this.readyState = 3; this.emit("close"); }
+          }
+          const module = { exports: {} };
+          runInNewContext(readFileSync(require.resolve("../services/speech-to-text"), "utf8"), {
+            require: (name) => { assert.equal(name, "ws"); return FluxWebSocket; },
+            module, Buffer, URLSearchParams,
+            process: { env: { DEEPGRAM_API_KEY: "test-only" } },
+            console: { log() {}, warn() {}, error: (...args) => errors.push(args) },
+          });
+          const stream = module.exports.createSpeechToTextStream({
+            ...options,
+            onTranscript: (result) => { transcriptCompletion = options.onTranscript(result); },
+          });
+          fluxSocket.emit("open");
+          return stream;
+        }
         return { sendAudio() {}, close() {} };
       },
     },
@@ -130,11 +171,20 @@ test(scenario.name, async () => {
   assert.ok(speechKeyterms.includes("Example Business"));
   assert.ok(speechKeyterms.includes("Middlesbrough"));
   for (const entry of scenario.answers) {
-    const { text, speechFinal = true, raw, expectReply = true } =
+    const { text, speechFinal = true, raw, expectReply = true, event = "EndOfTurn", turnIndex: explicitTurnIndex } =
       typeof entry === "string" ? { text: entry } : entry;
-    now += 2000;
+    now += scenario.flux ? 500 : 2000;
     const previousReplyCount = spoken.length;
-    await onTranscript({ transcript: text, isFinal: true, speechFinal, raw });
+    if (scenario.flux) {
+      transcriptCompletion = null;
+      fluxSocket.emit("message", Buffer.from(JSON.stringify({
+        type: "TurnInfo", event, transcript: text, turn_index: explicitTurnIndex ?? turnIndex,
+      })));
+      if (event === "EndOfTurn" && explicitTurnIndex === undefined) turnIndex++;
+      await transcriptCompletion;
+    } else {
+      await onTranscript({ transcript: text, isFinal: true, speechFinal, raw });
+    }
     assert.equal(spoken.length, previousReplyCount + Number(expectReply), `Unexpected reply count for ${text}`);
     if (!expectReply) continue;
     const mark = outgoing.filter((message) => message.event === "mark").at(-1);
