@@ -10,6 +10,20 @@ const surveyScript = require("../services/survey-script");
 // results paths, with all telephony/network services replaced by local fakes.
 for (const scenario of [
   {
+    name: "Flux confirms a misheard Friday and only books after 10pm is replaced with 10am",
+    flux: true,
+    callback: true,
+    answers: [
+      "Jack speaking.", "Yes", "Yes", "Yes", "Yes", "Two years",
+      "Yes", "Yes", "Dog walking", "Yes", "Yes",
+      { text: "Rider.", expectedReply: /Did you say Friday for the callback/ },
+      { text: "Yes", expectedReply: /between 9am and 5pm/ },
+      { text: "Ten PM.", expectedReply: /specific time between 9am and 5pm/ },
+      { text: "10 AM", expectedReply: /arranged the callback for Friday at 10 am/ },
+    ],
+    websiteAge: "Two years",
+  },
+  {
     name: "the server closes a declined callback and posts no callback booking",
     answers: ["Jack speaking.", "No. I'm not.", "No. I'm not.", "No. Thank you."],
     websiteAge: null,
@@ -171,7 +185,7 @@ test(scenario.name, async () => {
   assert.ok(speechKeyterms.includes("Example Business"));
   assert.ok(speechKeyterms.includes("Middlesbrough"));
   for (const entry of scenario.answers) {
-    const { text, speechFinal = true, raw, expectReply = true, event = "EndOfTurn", turnIndex: explicitTurnIndex } =
+    const { text, speechFinal = true, raw, expectReply = true, expectedReply, event = "EndOfTurn", turnIndex: explicitTurnIndex } =
       typeof entry === "string" ? { text: entry } : entry;
     now += scenario.flux ? 500 : 2000;
     const previousReplyCount = spoken.length;
@@ -186,13 +200,20 @@ test(scenario.name, async () => {
       await onTranscript({ transcript: text, isFinal: true, speechFinal, raw });
     }
     assert.equal(spoken.length, previousReplyCount + Number(expectReply), `Unexpected reply count for ${text}`);
+    if (expectedReply) assert.match(spoken.at(-1), expectedReply);
+    if (scenario.callback && text !== "10 AM") {
+      assert.ok([...timers.values()].every((timer) => timer.delay !== 1200), "Callback must not end before a valid time is supplied");
+      assert.equal(results.length, 0);
+    }
     if (!expectReply) continue;
     const mark = outgoing.filter((message) => message.event === "mark").at(-1);
     socket.emit("message", JSON.stringify(mark));
   }
 
-  assert.equal(spoken.at(-1), surveyScript.buildCallbackDeclinedMessage());
-  assert.ok(spoken.every((text) => !/what day|what time/i.test(text)));
+  if (!scenario.callback) {
+    assert.equal(spoken.at(-1), surveyScript.buildCallbackDeclinedMessage());
+    assert.ok(spoken.every((text) => !/what day|what time/i.test(text)));
+  }
   assert.equal(endedCalls.length, 0, "The closing audio must finish before hangup");
   const finalHangup = [...timers.values()].find((timer) => timer.delay === 1200);
   assert.ok(finalHangup, "No hangup was scheduled after the closing playback mark");
@@ -202,13 +223,22 @@ test(scenario.name, async () => {
   assert.deepEqual(errors, []);
   assert.deepEqual(endedCalls, ["CA-test-refusal"]);
   assert.equal(results.length, 1);
-  assert.equal(results[0].reason, "Callback declined");
-  assert.equal(results[0].outcome, "Not interested");
-  assert.equal(results[0].survey.callback_consent, "no");
-  assert.equal(results[0].survey.callback_requested, false);
-  assert.equal(results[0].survey.callback_date, null);
-  assert.equal(results[0].survey.callback_time, null);
-  assert.equal(results[0].memory.callbackConfirmed, false);
+  if (scenario.callback) {
+    assert.equal(results[0].reason, "Callback arranged");
+    assert.equal(results[0].survey.callback_consent, "yes");
+    assert.equal(results[0].survey.callback_requested, true);
+    assert.equal(results[0].survey.callback_date, "Friday");
+    assert.equal(results[0].survey.callback_time, "10 am");
+    assert.equal(results[0].memory.callbackConfirmed, true);
+  } else {
+    assert.equal(results[0].reason, "Callback declined");
+    assert.equal(results[0].outcome, "Not interested");
+    assert.equal(results[0].survey.callback_consent, "no");
+    assert.equal(results[0].survey.callback_requested, false);
+    assert.equal(results[0].survey.callback_date, null);
+    assert.equal(results[0].survey.callback_time, null);
+    assert.equal(results[0].memory.callbackConfirmed, false);
+  }
   assert.equal(results[0].survey.website_age, scenario.websiteAge);
   if (scenario.correctedBusiness) {
     assert.equal(results[0].customer.business_name, "New Business");

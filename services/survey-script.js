@@ -1,3 +1,5 @@
+const { isCallbackTimeWithinHours } = require("./callback-time");
+
 function cleanText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
@@ -177,7 +179,8 @@ function hasDeclinedCallback(memory = {}) {
 function hasCallbackSlot(memory = {}) {
   return Boolean(
     !hasDeclinedCallback(memory) && !memory.doNotCall &&
-    memory.callbackDate && memory.callbackTime
+    memory.callbackDate && !memory.pendingCallbackDate &&
+    isCallbackTimeWithinHours(memory.callbackTime)
   );
 }
 
@@ -339,6 +342,10 @@ function inferQuestionKeyFromAssistantReply(reply = "") {
     return "callback_day";
   }
 
+  if (lower.includes("did you say") && lower.includes("for the callback")) {
+    return "callback_day_confirmation";
+  }
+
   if (lower.includes("what time would suit")) {
     return "callback_time";
   }
@@ -367,13 +374,25 @@ function getScriptedNextQuestion(
     return null;
   }
 
+  if (memory.pendingCallbackDate) {
+    return `Did you say ${memory.pendingCallbackDate} for the callback?`;
+  }
+
+  if (memory.callbackDateNeedsClarification && !memory.callbackDate) {
+    return "Sorry, what day would suit you best for the callback? Please say the day, such as this Friday or next Monday.";
+  }
+
+  if (memory.callbackTimeNeedsClarification) {
+    return "Please choose a specific time between 9am and 5pm. What time would suit you best?";
+  }
+
   if (memory.busy) {
     if (!memory.callbackDate) {
       return "No problem at all. What day would be better for us to call you back?";
     }
 
-    if (!memory.callbackTime) {
-      return "And what time would suit you best for the callback?";
+    if (!isCallbackTimeWithinHours(memory.callbackTime)) {
+      return "And what time would suit you best for the callback, between 9am and 5pm?";
     }
 
     return null;
@@ -396,8 +415,8 @@ function getScriptedNextQuestion(
       return "What day would suit best for that callback?";
     }
 
-    if (!memory.callbackTime) {
-      return "And what time would suit best?";
+    if (!isCallbackTimeWithinHours(memory.callbackTime)) {
+      return "And what time would suit you best, between 9am and 5pm?";
     }
 
     return null;
@@ -483,8 +502,8 @@ function getScriptedNextQuestion(
     return "Fantastic. What day would suit you best for the callback?";
   }
 
-  if (!memory.callbackTime) {
-    return "And what time would suit you best?";
+  if (!isCallbackTimeWithinHours(memory.callbackTime)) {
+    return "And what time would suit you best, between 9am and 5pm?";
   }
 
   return null;

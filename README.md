@@ -29,3 +29,15 @@ and [API reference](https://developers.deepgram.com/reference/speech-to-text/lis
 Run `npm test` for the local regression suite and restart the app with `npm start`
 after deploying the changes. A live transcription check requires a valid
 Deepgram API key and incoming Twilio audio.
+
+## Callback scheduling
+
+Weekday names are included in the recognition hints. When a callback-day answer
+is transcribed as "Rider", the agent asks whether the caller meant Friday and
+waits for confirmation. Rejecting that suggestion asks for another day.
+
+All callback time questions offer 9am to 5pm in the business's local time.
+Out-of-hours answers, such as 10pm, and vague time windows require a specific
+replacement time before the callback is confirmed. Spoken hours, AM/PM and
+24-hour clock times are supported; a bare hour such as "three" in response to
+the time question is read back as 3pm within the offered window.

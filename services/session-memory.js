@@ -6,6 +6,7 @@ const {
   inferQuestionKeyFromAssistantReply,
   isFinancialAuthorityPrompt,
 } = require("./survey-script");
+const { callbackTimeMinutes, isCallbackTimeWithinHours, formatCallbackClock } = require("./callback-time");
 
 function createSessionMemory() {
   return {
@@ -36,7 +37,10 @@ function createSessionMemory() {
     industry: null,
     callbackConsent: null,
     callbackDate: null,
+    pendingCallbackDate: null,
+    callbackDateNeedsClarification: false,
     callbackTime: null,
+    callbackTimeNeedsClarification: false,
     callbackRequested: null,
     callbackConfirmed: false,
     busy: false,
@@ -492,6 +496,13 @@ function extractDateLikeText(text) {
   );
 }
 
+function suggestCallbackDay(text) {
+  // Only suggest this known mishearing while collecting a callback day.
+  // The caller must confirm it before it becomes a scheduled date.
+  const match = compactText(text).match(/^(?:(this|next)\s+)?(?:rider|fry day|fryday)(?:\s+please)?$/);
+  return match ? `${match[1] ? `${match[1]} ` : ""}Friday` : null;
+}
+
 function extractTimeLikeText(text) {
   const numberPattern =
     "(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\\d{1,2})";
@@ -499,14 +510,14 @@ function extractTimeLikeText(text) {
   return (
     extractAfterPatterns(text, [
       /\b(after lunchtime|after lunch|before lunchtime|before lunch|around lunchtime|around lunch|late morning|early morning|early afternoon|late afternoon)\b/i,
-      new RegExp(`\\b(any time after\\s+${numberPattern}(?::\\d{2})?\\s*(?:am|pm)?)\\b`, "i"),
-      new RegExp(`\\b(any time before\\s+${numberPattern}(?::\\d{2})?\\s*(?:am|pm)?)\\b`, "i"),
+      new RegExp(`\\b((?:any time )?after\\s+${numberPattern}(?::\\d{2})?\\s*(?:am|pm)?)\\b`, "i"),
+      new RegExp(`\\b((?:any time )?before\\s+${numberPattern}(?::\\d{2})?\\s*(?:am|pm)?)\\b`, "i"),
       new RegExp(`\\b(between\\s+${numberPattern}(?::\\d{2})?\\s*(?:am|pm)?\\s+and\\s+${numberPattern}(?::\\d{2})?\\s*(?:am|pm)?)\\b`, "i"),
-      new RegExp(`\\b(from\\s+${numberPattern}(?::\\d{2})?\\s*(?:am|pm)?\\s+(?:to|until)\\s+${numberPattern}(?::\\d{2})?\\s*(?:am|pm)?)\\b`, "i"),
+      new RegExp(`\\b((?:from\\s+)?${numberPattern}(?::\\d{2})?\\s*(?:am|pm)?\\s*(?:to|until|-)\\s*${numberPattern}(?::\\d{2})?\\s*(?:am|pm)?)\\b`, "i"),
       new RegExp(`\\b((?:about|around)\\s+(?:half\\s+past\\s+${numberPattern}|half\\s+${numberPattern}|quarter\\s+(?:past|to)\\s+${numberPattern}|${numberPattern}\\s*o'?clock|${numberPattern}(?::\\d{2})?\\s*(?:am|pm)?))\\b`, "i"),
-      new RegExp(`\\b((?:half\\s+past\\s+${numberPattern}|half\\s+${numberPattern}))\\b`, "i"),
-      new RegExp(`\\b((?:quarter\\s+(?:past|to)\\s+${numberPattern}))\\b`, "i"),
-      new RegExp(`\\b(${numberPattern}\\s*o'?clock)\\b`, "i"),
+      new RegExp(`\\b((?:half\\s+past\\s+${numberPattern}|half\\s+${numberPattern})\\s*(?:am|pm)?)\\b`, "i"),
+      new RegExp(`\\b((?:quarter\\s+(?:past|to)\\s+${numberPattern})\\s*(?:am|pm)?)\\b`, "i"),
+      new RegExp(`\\b(${numberPattern}\\s*o'?clock\\s*(?:am|pm)?)\\b`, "i"),
       new RegExp(`\\b(${numberPattern}(?::\\d{2})?\\s*(?:am|pm))\\b`, "i"),
       /\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b/i,
       /\b((?:morning|afternoon|evening|lunchtime))\b/i,
@@ -847,15 +858,26 @@ function isLowConfidenceIndustry(text) {
   return false;
 }
 
-function normaliseCallbackTimeAnswer(text) {
+function normaliseCallbackTimeAnswer(text, allowBareHour = false) {
   const candidate = cleanValue(text);
-  const lower = compactText(candidate).replace(
-    /^(?:about|around|at about|at around|roughly|maybe|probably|say)\s+/,
-    ""
-  );
+  const lower = compactText(candidate)
+    .replace(/\b([ap])\.?\s*m\.?/g, "$1m")
+    .replace(/\s+(?:in the|at)\s+(morning|afternoon|evening|night)\b/g, (_, period) => period === "morning" ? " am" : " pm")
+    .replace(
+      /^(?:about|around|at about|at around|roughly|maybe|probably|say)\s+/,
+      ""
+    );
 
   if (!lower) {
     return null;
+  }
+
+  if (!allowBareHour && /^(?:at\s+)?(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\d{1,2})$/.test(lower)) {
+    return null;
+  }
+
+  if (callbackTimeMinutes(lower) !== null) {
+    return /\b(?:am|pm)\b/.test(lower) ? lower : formatCallbackClock(lower);
   }
 
   const normalisedMappings = new Map([
@@ -894,7 +916,24 @@ function normaliseCallbackTimeAnswer(text) {
     return extractedLower.replace(/^half\s+/, "half past ");
   }
 
-  return cleanValue(extractedLower);
+  return callbackTimeMinutes(extractedLower) !== null && !/\b(?:am|pm)\b/.test(extractedLower)
+    ? formatCallbackClock(extractedLower)
+    : cleanValue(extractedLower);
+}
+
+function recordCallbackTime(memory, candidate, changedFields) {
+  if (!candidate) return null;
+  setField(memory, "callbackConfirmed", false, changedFields);
+  if (!isCallbackTimeWithinHours(candidate)) {
+    clearField(memory, "callbackTime", changedFields);
+    setField(memory, "callbackTimeNeedsClarification", true, changedFields);
+    pushNote(memory, `Callback time needs a specific time between 9am and 5pm: ${candidate}`, changedFields);
+    return null;
+  }
+  setField(memory, "callbackTime", candidate, changedFields);
+  setField(memory, "callbackTimeNeedsClarification", false, changedFields);
+  setField(memory, "callbackRequested", true, changedFields);
+  return candidate;
 }
 
 function setField(memory, field, value, changedFields) {
@@ -962,11 +1001,16 @@ function isCallbackRefusal(text, promptKey, promptText) {
     /\b(?:no|without)\s+(?:(?:a|any|another)\s+)?call\s*back\b/.test(answer) ||
     /\b(?:not interested|no need|cancel|don't call|do not call)\b/.test(answer)
   );
-  const answeringCallback = ["callback_consent", "callback_day", "callback_time", "callback_general"].includes(promptKey) ||
+  const answeringCallback = ["callback_consent", "callback_day", "callback_day_confirmation", "callback_time", "callback_general"].includes(promptKey) ||
     (!promptKey && /\b(?:callback|call (?:you |me )?back)\b/i.test(promptText));
 
   if (explicitRefusal) {
     return true;
+  }
+
+  if (promptKey === "callback_day_confirmation" &&
+      !/\b(?:no thanks|no thank you|not interested|rather not)\b/.test(answer)) {
+    return false;
   }
 
   if (!answeringCallback) {
@@ -991,7 +1035,10 @@ function recordCallbackRefusal(memory, changedFields) {
   setField(memory, "callbackRequested", false, changedFields);
   setField(memory, "callbackConfirmed", false, changedFields);
   clearField(memory, "callbackDate", changedFields);
+  clearField(memory, "pendingCallbackDate", changedFields);
+  setField(memory, "callbackDateNeedsClarification", false, changedFields);
   clearField(memory, "callbackTime", changedFields);
+  setField(memory, "callbackTimeNeedsClarification", false, changedFields);
   setField(memory, "busy", false, changedFields);
 }
 
@@ -1093,6 +1140,25 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     setField(memory, "interestInMoreEnquiries", "no", changedFields);
   }
 
+  if (promptKey === "callback_day_confirmation") {
+    const replacementDate = /\b(?:not|can't|cannot)\b/i.test(questionRawText)
+      ? null : extractDateLikeText(questionRawText);
+    const confirmedDate = replacementDate ||
+      (!isNegativeAnswer(questionRawText) && isAffirmativeAnswer(questionRawText) ? memory.pendingCallbackDate : null);
+    if (confirmedDate) {
+      setField(memory, "callbackDate", confirmedDate, changedFields);
+      setField(memory, "callbackRequested", true, changedFields);
+      clearField(memory, "pendingCallbackDate", changedFields);
+      setField(memory, "callbackDateNeedsClarification", false, changedFields);
+    } else if (isNegativeAnswer(questionRawText)) {
+      clearField(memory, "pendingCallbackDate", changedFields);
+      setField(memory, "callbackDateNeedsClarification", true, changedFields);
+    }
+    recordCallbackTime(memory, normaliseCallbackTimeAnswer(questionRawText), changedFields);
+    if (changedFields.length) memory.lastUpdatedAt = new Date().toISOString();
+    return { changedFields, memory };
+  }
+
   if (BUSINESS_DETAIL_PROMPTS.has(promptKey)) {
     if (!memory.wrongNumber && !memory.doNotCall && !memory.busy && !memory.notInterested) {
       updateBusinessDetails(memory, questionRawText, promptKey, {
@@ -1102,7 +1168,7 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     }
     if (memory.busy) {
       setField(memory, "callbackDate", extractDateLikeText(questionRawText), changedFields);
-      setField(memory, "callbackTime", normaliseCallbackTimeAnswer(questionRawText), changedFields);
+      recordCallbackTime(memory, normaliseCallbackTimeAnswer(questionRawText), changedFields);
     }
     if (changedFields.length) {
       memory.lastUpdatedAt = new Date().toISOString();
@@ -1116,7 +1182,7 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     }
     if (memory.busy) {
       setField(memory, "callbackDate", extractDateLikeText(questionRawText), changedFields);
-      setField(memory, "callbackTime", normaliseCallbackTimeAnswer(questionRawText), changedFields);
+      recordCallbackTime(memory, normaliseCallbackTimeAnswer(questionRawText), changedFields);
     }
     if (changedFields.length) {
       memory.lastUpdatedAt = new Date().toISOString();
@@ -1637,10 +1703,14 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     assistantAskedCallbackTime || assistantAskedCallbackGeneral) &&
     /^(?:not|can't|cannot|don't|do not|won't|will not)\b/i.test(schedulingText);
   const callbackDate = rejectedSlot ? null : extractDateLikeText(questionRawText);
-  const callbackTime = rejectedSlot ? null : normaliseCallbackTimeAnswer(questionRawText);
+  const callbackTime = rejectedSlot ? null : recordCallbackTime(
+    memory, normaliseCallbackTimeAnswer(questionRawText, assistantAskedCallbackTime), changedFields
+  );
 
   if (callbackDate) {
     setField(memory, "callbackDate", callbackDate, changedFields);
+    clearField(memory, "pendingCallbackDate", changedFields);
+    setField(memory, "callbackDateNeedsClarification", false, changedFields);
     setField(memory, "callbackRequested", true, changedFields);
   }
 
@@ -1661,6 +1731,9 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
       setField(memory, "callbackDate", callbackDate, changedFields);
       setField(memory, "callbackRequested", true, changedFields);
     } else {
+      const suggestedDay = !rejectedSlot && suggestCallbackDay(questionRawText);
+      if (suggestedDay) setField(memory, "pendingCallbackDate", suggestedDay, changedFields);
+      setField(memory, "callbackDateNeedsClarification", true, changedFields);
       pushNote(memory, `Unclear callback day: ${questionRawText}`, changedFields);
     }
   }
@@ -1670,6 +1743,7 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
       setField(memory, "callbackTime", callbackTime, changedFields);
       setField(memory, "callbackRequested", true, changedFields);
     } else {
+      setField(memory, "callbackTimeNeedsClarification", true, changedFields);
       pushNote(memory, `Unclear callback time: ${questionRawText}`, changedFields);
     }
   }
@@ -1764,7 +1838,10 @@ function formatSessionMemoryForPrompt(memory) {
     `Industry: ${formatValue(memory.industry)}`,
     `Callback consent: ${formatValue(memory.callbackConsent)}`,
     `Callback date: ${formatValue(memory.callbackDate)}`,
+    `Callback date awaiting confirmation: ${formatValue(memory.pendingCallbackDate)}`,
+    `Callback day needs clarification: ${formatValue(memory.callbackDateNeedsClarification)}`,
     `Callback time: ${formatValue(memory.callbackTime)}`,
+    `Callback time needs clarification: ${formatValue(memory.callbackTimeNeedsClarification)}`,
     `Busy: ${formatValue(memory.busy)}`,
     `Not interested: ${formatValue(memory.notInterested)}`,
     `Wrong number: ${formatValue(memory.wrongNumber)}`,
@@ -1802,7 +1879,10 @@ function formatSessionMemoryForLog(memory) {
     industry: memory.industry,
     callbackConsent: memory.callbackConsent,
     callbackDate: memory.callbackDate,
+    pendingCallbackDate: memory.pendingCallbackDate,
+    callbackDateNeedsClarification: memory.callbackDateNeedsClarification,
     callbackTime: memory.callbackTime,
+    callbackTimeNeedsClarification: memory.callbackTimeNeedsClarification,
     callbackRequested: memory.callbackRequested,
     callbackConfirmed: memory.callbackConfirmed,
     busy: memory.busy,
