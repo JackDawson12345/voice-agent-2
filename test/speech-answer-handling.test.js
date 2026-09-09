@@ -17,6 +17,43 @@ function answer(memory, text, key) {
   updateSessionMemoryFromTranscript(memory, text, { promptKey, promptText });
 }
 
+for (const text of ["Yes.", "Yeah.", "Yep", "Yup.", "Yeh", "Uh-huh.", "Mm-hmm.", "Mhm"]) {
+  test(`short spoken confirmations advance the current question: ${text}`, () => {
+    const memory = websiteMemory();
+    memory.websiteStatus = null;
+    answer(memory, text, "website_status");
+    assert.equal(memory.websiteStatus, "yes");
+    assert.equal(memory.websiteAge, null);
+    answer(memory, "Two yes", "website_age");
+    answer(memory, text, "website_age_confirmation");
+    assert.equal(memory.websiteAge, "Two years");
+    answer(memory, text, "online_enquiries");
+    assert.equal(memory.onlineEnquiryStatus, "yes");
+  });
+}
+
+test("an incomplete enquiry answer is clarified without guessing, then a complete frequency advances", () => {
+  const memory = websiteMemory();
+  memory.websiteAge = "Two years";
+  answer(memory, "times", "online_enquiries");
+  assert.equal(memory.onlineEnquiryStatus, null);
+  assert.match(getScriptedNextQuestion(memory), /yes, no, or sometimes/);
+  answer(memory, "Two times.", "online_enquiries");
+  assert.equal(memory.onlineEnquiryStatus, "Two times");
+  assert.equal(memory.onlineEnquiryNeedsClarification, false);
+  assert.equal(inferQuestionKeyFromAssistantReply(getScriptedNextQuestion(memory)), "more_enquiries");
+});
+
+for (const [text, expected] of [["Sometimes.", "sometimes"], ["Some times", "sometimes"], ["Twice a week", "Twice a week"], ["No.", "no"]]) {
+  test(`clarifying enquiry frequency accepts the caller's answer: ${text}`, () => {
+    const memory = websiteMemory();
+    memory.websiteAge = "Two years";
+    answer(memory, "Times", "online_enquiries");
+    answer(memory, text, "online_enquiries");
+    assert.equal(memory.onlineEnquiryStatus, expected);
+  });
+}
+
 for (const [text, expected] of [
   ["Yes, two years", "two years"], ["I've had it for two years", "two years"],
   ["We have had it for 3 months", "3 months"], ["Two. Years.", "Two Years"],

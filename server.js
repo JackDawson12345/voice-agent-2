@@ -520,6 +520,7 @@ wss.on("connection", (ws) => {
   let lastInterruptionTranscript = "";
   let activePromptKey = null;
   let activePromptText = "";
+  let pendingFluxPrompt = null;
   const pendingCustomerSegments = [];
 
   function addTranscriptLine(role, content) {
@@ -1005,7 +1006,7 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    if (aiIsSpeaking) {
+    if (aiIsSpeaking || pendingFluxPrompt) {
       return;
     }
 
@@ -1630,7 +1631,7 @@ wss.on("connection", (ws) => {
     return false;
   }
 
-  async function processFinalCustomerTranscript(cleanTranscript) {
+  async function processFinalCustomerTranscript(cleanTranscript, answerPrompt = null) {
     console.log("Customer said:", cleanTranscript);
     addTranscriptLine("customer", cleanTranscript);
 
@@ -1640,8 +1641,8 @@ wss.on("connection", (ws) => {
       {
         conversationHistory,
         callProfile: getCurrentCallProfile(),
-        promptKey: activePromptKey,
-        promptText: activePromptText,
+        promptKey: answerPrompt ? answerPrompt.key : activePromptKey,
+        promptText: answerPrompt ? answerPrompt.text : activePromptText,
       }
     );
 
@@ -1737,19 +1738,16 @@ wss.on("connection", (ws) => {
       });
 
       if (!aiReply) {
-        aiIsThinking = false;
         return;
       }
 
-      if (thisResponseId !== responseGenerationId) {
+      if (callIsEnding || thisResponseId !== responseGenerationId) {
         console.log("AI reply discarded because customer interrupted.");
-        aiIsThinking = false;
         return;
       }
 
       if (voicemailHandled) {
         console.log("AI reply discarded because voicemail has been handled.");
-        aiIsThinking = false;
         return;
       }
 
@@ -1787,8 +1785,6 @@ wss.on("connection", (ws) => {
         }) || sessionMemory.callbackConfirmed === true;
 
       console.log("AI replied:", aiReply);
-      addTranscriptLine("assistant", aiReply);
-      updateActivePrompt(aiReply);
 
       console.log("TTS started");
 
@@ -1801,15 +1797,13 @@ wss.on("connection", (ws) => {
         totalMs: ttsFinishedAt - responseStartedAt,
       });
 
-      if (thisResponseId !== responseGenerationId) {
+      if (callIsEnding || thisResponseId !== responseGenerationId) {
         console.log("AI audio discarded because customer interrupted.");
-        aiIsThinking = false;
         return;
       }
 
       if (voicemailHandled) {
         console.log("AI audio discarded because voicemail has been handled.");
-        aiIsThinking = false;
         return;
       }
 
@@ -1818,6 +1812,10 @@ wss.on("connection", (ws) => {
       activeAudioMark = markName;
       aiIsSpeaking = true;
       interruptionHappened = false;
+      // An answer received during synthesis still belongs to the last question
+      // the caller heard. Activate the next question only when playback starts.
+      updateActivePrompt(aiReply);
+      addTranscriptLine("assistant", aiReply);
 
       if (shouldHangUp) {
         const hangupReason = sessionMemory.callbackConfirmed
@@ -1851,18 +1849,18 @@ wss.on("connection", (ws) => {
       if (conversationHistory.length > 10) {
         conversationHistory.splice(0, conversationHistory.length - 10);
       }
-
-      aiIsThinking = false;
     } catch (error) {
-      aiIsThinking = false;
+      if (callIsEnding || thisResponseId !== responseGenerationId) return;
       console.error("AI or text-to-speech error:", error.message);
       addTranscriptLine("system", `AI or text-to-speech error: ${error.message}`);
       await endCallNow("AI or text-to-speech error");
+    } finally {
+      if (thisResponseId === responseGenerationId) aiIsThinking = false;
     }
   }
 
   function looksLikeRealInterruption(text) {
-    const cleanText = String(text || "").trim();
+    const cleanText = String(text || "").replace(/[.,!?]+/g, " ").trim();
 
     if (!cleanText) {
       return false;
@@ -1895,6 +1893,15 @@ wss.on("connection", (ws) => {
       "actually",
       "no",
       "yes",
+      "yeah",
+      "yep",
+      "yup",
+      "yeh",
+      "uh huh",
+      "uh-huh",
+      "mm hmm",
+      "mm-hmm",
+      "mhm",
       "what",
       "how",
       "can",
@@ -1922,6 +1929,17 @@ wss.on("connection", (ws) => {
     return false;
   }
 
+  function interruptCurrentResponse(transcript) {
+    interruptionHappened = true;
+    lastInterruptionTranscript = transcript;
+    responseGenerationId++;
+    aiIsThinking = false;
+    if (aiIsSpeaking) clearTwilioAudio(ws, currentStreamSid);
+    cancelActiveAudioTracking();
+    clearSilenceTimer();
+    clearPendingBargeInTimer();
+  }
+
   function scheduleBargeIn(cleanTranscript) {
     if (!aiIsSpeaking) {
       return;
@@ -1943,8 +1961,9 @@ wss.on("connection", (ws) => {
 
     // Wait briefly before clearing audio.
     // This makes interruption feel less harsh and filters out quick false starts.
+    const interruptedMark = activeAudioMark;
     pendingBargeInTimer = setTimeout(() => {
-      if (!aiIsSpeaking) {
+      if (!aiIsSpeaking || activeAudioMark !== interruptedMark) {
         clearPendingBargeInTimer();
         return;
       }
@@ -1956,17 +1975,7 @@ wss.on("connection", (ws) => {
 
       console.log("Customer interrupted AI:", pendingBargeInTranscript);
 
-      interruptionHappened = true;
-      lastInterruptionTranscript = pendingBargeInTranscript;
-
-      // Invalidate current AI/TTS work.
-      responseGenerationId++;
-
-      clearTwilioAudio(ws, currentStreamSid);
-      cancelActiveAudioTracking();
-
-      clearSilenceTimer();
-      clearPendingBargeInTimer();
+      interruptCurrentResponse(pendingBargeInTranscript);
     }, BARGE_IN_DEBOUNCE_MS);
   }
 
@@ -1980,8 +1989,10 @@ wss.on("connection", (ws) => {
     }) => {
       try {
         const cleanTranscript = normaliseTranscriptText(transcript);
+        const isFluxTurn = raw?.type === "TurnInfo";
+        const speechStarted = isFluxTurn && raw.event === "StartOfTurn";
 
-        if (!cleanTranscript && !utteranceEnd && !speechFinal) {
+        if (!cleanTranscript && !utteranceEnd && !speechFinal && !speechStarted) {
           return;
         }
 
@@ -1994,6 +2005,13 @@ wss.on("connection", (ws) => {
           return;
         }
 
+        // Keep the question from the beginning of the caller's turn, even if
+        // its final transcript arrives after another prompt starts playing.
+        if (isFluxTurn && (speechStarted || cleanTranscript) &&
+            (!pendingFluxPrompt || pendingFluxPrompt.turnIndex !== raw.turn_index)) {
+          pendingFluxPrompt = { turnIndex: raw.turn_index, key: activePromptKey, text: activePromptText };
+        }
+
         // Any real transcript means the customer, voicemail, or screening assistant has spoken.
         // Stop silence timeout while we process it.
         clearSilenceTimer();
@@ -2001,6 +2019,7 @@ wss.on("connection", (ws) => {
         // 1. iPhone call screening comes first.
         // This must not be treated as voicemail.
         if (isIphoneCallScreeningPrompt(cleanTranscript)) {
+          pendingFluxPrompt = null;
           silenceCheckCount = 0;
           await answerIphoneCallScreeningPrompt();
           return;
@@ -2009,6 +2028,7 @@ wss.on("connection", (ws) => {
         // 2. Voicemail / answer machine comes second.
         // This leaves one message, then hangs up.
         if (isVoicemailOrAnswerMachine(cleanTranscript)) {
+          pendingFluxPrompt = null;
           silenceCheckCount = 0;
           await leaveVoicemailAndHangUp(cleanTranscript);
           return;
@@ -2029,8 +2049,6 @@ wss.on("connection", (ws) => {
           clearIntroTimer();
         }
 
-        const isFluxTurn = raw?.type === "TurnInfo";
-
         if (!isFluxTurn && isFinal && cleanTranscript) {
           storePendingCustomerSegment(cleanTranscript, raw);
         }
@@ -2050,8 +2068,11 @@ wss.on("connection", (ws) => {
 
         resetPendingCustomerUtterance();
         lastInterruptionTranscript = "";
+        const answerPrompt = isFluxTurn ? pendingFluxPrompt : null;
+        pendingFluxPrompt = null;
 
         if (!finalTranscript) {
+          startSilenceTimer();
           return;
         }
 
@@ -2069,7 +2090,12 @@ wss.on("connection", (ws) => {
         lastFinalTranscriptAt = processedAt;
         silenceCheckCount = 0;
 
-        await processFinalCustomerTranscript(finalTranscript);
+        // A completed short answer can arrive before the interim debounce fires.
+        // Clear the old playback/timer now so it cannot cancel the next reply.
+        // This also cancels synthesis without advancing to an unheard question.
+        interruptCurrentResponse(finalTranscript);
+        lastInterruptionTranscript = "";
+        await processFinalCustomerTranscript(finalTranscript, answerPrompt);
       } catch (error) {
         aiIsThinking = false;
         console.error("Transcript handling error:", error.message);
@@ -2170,6 +2196,9 @@ wss.on("connection", (ws) => {
       }
 
       if (data.event === "stop") {
+        callIsEnding = true;
+        responseGenerationId++;
+        cancelActiveAudioTracking();
         clearIntroTimer();
         clearSilenceTimer();
         clearPendingBargeInTimer();
@@ -2196,6 +2225,9 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
+    callIsEnding = true;
+    responseGenerationId++;
+    cancelActiveAudioTracking();
     clearIntroTimer();
     clearSilenceTimer();
     clearPendingBargeInTimer();
@@ -2214,6 +2246,9 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("error", (error) => {
+    callIsEnding = true;
+    responseGenerationId++;
+    cancelActiveAudioTracking();
     clearIntroTimer();
     clearSilenceTimer();
     clearPendingBargeInTimer();

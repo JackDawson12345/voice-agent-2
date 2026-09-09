@@ -32,6 +32,7 @@ function createSessionMemory() {
     websiteAgeNeedsClarification: false,
     websiteInterestLevel: null,
     onlineEnquiryStatus: null,
+    onlineEnquiryNeedsClarification: false,
     interestInMoreEnquiries: null,
     pendingIndustry: null,
     industry: null,
@@ -111,7 +112,7 @@ function hasAny(text, phrases) {
 }
 
 function isSimpleYes(text) {
-  return /^(?:yes|yeah|yep|yeh|sure|okay|ok|correct|that'?s right|that is right|that is correct|that'?s correct|i am|i'm|it is|that is|fine|go ahead|please do|happy to|absolutely|definitely|indeed)[.!?\s]*$/i.test(
+  return /^(?:yes|yeah|yep|yup|yeh|uh[ -]?huh|mm[ -]?hmm|mhm|sure|okay|ok|correct|that'?s right|that is right|that is correct|that'?s correct|i am|i'm|it is|that is|fine|go ahead|please do|happy to|absolutely|definitely|indeed)[.!?\s]*$/i.test(
     cleanValue(text)
   );
 }
@@ -133,7 +134,7 @@ function isAffirmativeAnswer(text) {
     return true;
   }
 
-  return /\b(yes|yeah|yep|yeh|sure|okay|ok|correct|that'?s right|that is right|that is correct|go ahead|please do|happy to|i do|we do|i have|we have|it is)\b/i.test(
+  return /\b(yes|yeah|yep|yup|yeh|sure|okay|ok|correct|that'?s right|that is right|that is correct|go ahead|please do|happy to|i do|we do|i have|we have|it is)\b/i.test(
     lower
   );
 }
@@ -613,6 +614,12 @@ function normaliseOnlineEnquiryAnswer(text) {
 
   if (isNegativeAnswer(lower) || hasAny(lower, ["none", "never"])) {
     return "no";
+  }
+
+  // A complete frequency is a useful answer in this question's context.
+  // A bare "times" is incomplete and must not be guessed to mean "sometimes".
+  if (/^(?:(?:once|twice)|(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|a few|a couple of|several)\s+times)(?:\s+(?:a|per|each)\s+(?:day|week|month|year))?$/i.test(lower)) {
+    return cleanValue(text);
   }
 
   if (looksLikeOnlineEnquiryAnswer(text)) {
@@ -1619,12 +1626,14 @@ function updateSessionMemoryFromTranscript(memory, transcript, context = {}) {
     }
   }
 
-  if (assistantAskedOnlineEnquiries) {
+  if (assistantAskedOnlineEnquiries && !/^(?:who|what|when|where|why|how|can you|could you|would you|do you|did you)\b/i.test(questionRawText)) {
     const onlineEnquiryAnswer = normaliseOnlineEnquiryAnswer(questionRawText);
 
     if (onlineEnquiryAnswer) {
       setField(memory, "onlineEnquiryStatus", onlineEnquiryAnswer, changedFields);
+      setField(memory, "onlineEnquiryNeedsClarification", false, changedFields);
     } else if (shouldStoreRawAnswer(questionRawText)) {
+      setField(memory, "onlineEnquiryNeedsClarification", true, changedFields);
       pushNote(
         memory,
         `Unclear online enquiry answer: ${questionRawText}`,
@@ -1874,6 +1883,7 @@ function formatSessionMemoryForLog(memory) {
     websiteAgeNeedsClarification: memory.websiteAgeNeedsClarification,
     websiteInterestLevel: memory.websiteInterestLevel,
     onlineEnquiryStatus: memory.onlineEnquiryStatus,
+    onlineEnquiryNeedsClarification: memory.onlineEnquiryNeedsClarification,
     interestInMoreEnquiries: memory.interestInMoreEnquiries,
     pendingIndustry: memory.pendingIndustry,
     industry: memory.industry,

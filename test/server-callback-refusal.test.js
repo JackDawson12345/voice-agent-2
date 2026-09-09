@@ -9,6 +9,48 @@ const surveyScript = require("../services/survey-script");
 // Exercise the server's real transcript, reply, playback-mark, hangup and
 // results paths, with all telephony/network services replaced by local fakes.
 for (const scenario of [
+  ...["", "Yes"].map((interimText) => ({
+    name: `a Flux turn starting during synthesis keeps its original question (initial text: ${interimText || "empty"})`,
+    flux: true,
+    answers: [
+      "Jack speaking.", "Yes", "Yes", "Yes",
+      { text: "Yes", duringSynthesis: { text: interimText, event: "StartOfTurn" } },
+      { text: "Yes", expectedReply: /^How long have you had the website for/ },
+      "Two years", "I don't want a callback",
+    ],
+    websiteAge: "Two years",
+    noUnclearAge: true,
+  })),
+  ...[false, true].map((rejectSupersededTts) => ({
+    name: `a repeated yes during synthesis answers the question already heard (discarded TTS rejects: ${rejectSupersededTts})`,
+    flux: true,
+    rejectSupersededTts,
+    answers: [
+      "Jack speaking.", "Yes", "Yes", "Yes",
+      { text: "Yes", duringSynthesis: "Yes", expectedReply: /^How long have you had the website for/ },
+      "Two years", "I don't want a callback",
+    ],
+    websiteAge: "Two years",
+    noUnclearAge: true,
+  })),
+  {
+    name: "a call stopping during silence-check synthesis sends no more audio",
+    flux: true,
+    disconnectDuringSilence: true,
+    answers: ["Jack speaking.", "Yes"],
+  },
+  ...[false, true].map((slowTts) => ({
+    name: `short Flux answers during playback keep the next reply audible (slow TTS: ${slowTts})`,
+    flux: true,
+    playbackRace: true,
+    slowTts,
+    answers: [
+      ...["Jack speaking.", "Yep", "Yeah", "Yup", "Uh-huh", "Two years", "Times", "Two times"].map((text) => ({ text, finishPlayback: false })),
+      "I don't want a callback",
+    ],
+    websiteAge: "Two years",
+    onlineEnquiryStatus: "Two times",
+  })),
   {
     name: "Flux confirms a misheard Friday and only books after 10pm is replaced with 10am",
     flux: true,
@@ -83,6 +125,7 @@ test(scenario.name, async () => {
   let fluxSocket;
   let transcriptCompletion;
   let turnIndex = 0;
+  let synthesisAnswer = null;
   let websocketServer;
   const app = {
     use() {}, get() {}, all() {},
@@ -140,7 +183,21 @@ test(scenario.name, async () => {
       getAIResponse: async () => { throw new Error("These answers should use the scripted flow"); },
     },
     "./services/text-to-speech": {
-      textToSpeech: async (text) => { spoken.push(text); return Buffer.alloc(800); },
+      textToSpeech: async (text) => {
+        spoken.push(text);
+        if (scenario.slowTts) await fireBargeInTimers();
+        if (synthesisAnswer) {
+          const answer = typeof synthesisAnswer === "string" ? { text: synthesisAnswer } : synthesisAnswer;
+          synthesisAnswer = null;
+          now += 100;
+          await deliverFluxTurn(answer.text, answer.event);
+          if (scenario.rejectSupersededTts) throw new Error("Superseded TTS failed");
+        }
+        if (scenario.disconnectDuringSilence && text === "Hello, are you still on the line?") {
+          socket.emit("message", JSON.stringify({ event: "stop" }));
+        }
+        return Buffer.alloc(800);
+      },
     },
     "./services/session-memory": memoryService,
     "./services/survey-script": surveyScript,
@@ -184,30 +241,68 @@ test(scenario.name, async () => {
 
   assert.ok(speechKeyterms.includes("Example Business"));
   assert.ok(speechKeyterms.includes("Middlesbrough"));
+  async function fireBargeInTimers() {
+    for (const [id, timer] of [...timers]) {
+      if (timer.delay !== 250) continue;
+      timers.delete(id);
+      await timer.callback();
+    }
+  }
+
+  async function deliverFluxTurn(text, event = "EndOfTurn", explicitTurnIndex) {
+    const index = explicitTurnIndex ?? turnIndex;
+    if (event === "EndOfTurn" && explicitTurnIndex === undefined) turnIndex++;
+    transcriptCompletion = null;
+    fluxSocket.emit("message", Buffer.from(JSON.stringify({
+      type: "TurnInfo", event, transcript: text, turn_index: index,
+    })));
+    await transcriptCompletion;
+  }
+
   for (const entry of scenario.answers) {
-    const { text, speechFinal = true, raw, expectReply = true, expectedReply, event = "EndOfTurn", turnIndex: explicitTurnIndex } =
+    const { text, speechFinal = true, raw, expectReply = true, expectedReply, duringSynthesis, finishPlayback = true, event = "EndOfTurn", turnIndex: explicitTurnIndex } =
       typeof entry === "string" ? { text: entry } : entry;
     now += scenario.flux ? 500 : 2000;
     const previousReplyCount = spoken.length;
+    const previousMarkCount = outgoing.filter((message) => message.event === "mark").length;
+    synthesisAnswer = duringSynthesis;
     if (scenario.flux) {
-      transcriptCompletion = null;
-      fluxSocket.emit("message", Buffer.from(JSON.stringify({
-        type: "TurnInfo", event, transcript: text, turn_index: explicitTurnIndex ?? turnIndex,
-      })));
-      if (event === "EndOfTurn" && explicitTurnIndex === undefined) turnIndex++;
-      await transcriptCompletion;
+      await deliverFluxTurn(text, event, explicitTurnIndex);
     } else {
       await onTranscript({ transcript: text, isFinal: true, speechFinal, raw });
     }
-    assert.equal(spoken.length, previousReplyCount + Number(expectReply), `Unexpected reply count for ${text}`);
+    const extraReply = duringSynthesis && (typeof duringSynthesis === "string" || duringSynthesis.event === "EndOfTurn");
+    assert.equal(spoken.length, previousReplyCount + Number(expectReply) + Number(Boolean(extraReply)), `Unexpected reply count for ${text}`);
+    assert.equal(outgoing.filter((message) => message.event === "mark").length,
+      previousMarkCount + Number(expectReply), `Reply audio was lost for ${text}`);
+    if (scenario.playbackRace) {
+      const clearCount = outgoing.filter((message) => message.event === "clear").length;
+      await fireBargeInTimers();
+      assert.equal(outgoing.filter((message) => message.event === "clear").length,
+        clearCount, "An old interruption timer cleared the new reply");
+    }
     if (expectedReply) assert.match(spoken.at(-1), expectedReply);
     if (scenario.callback && text !== "10 AM") {
       assert.ok([...timers.values()].every((timer) => timer.delay !== 1200), "Callback must not end before a valid time is supplied");
       assert.equal(results.length, 0);
     }
-    if (!expectReply) continue;
+    if (!expectReply || !finishPlayback) continue;
     const mark = outgoing.filter((message) => message.event === "mark").at(-1);
     socket.emit("message", JSON.stringify(mark));
+  }
+
+  if (scenario.disconnectDuringSilence) {
+    const previousMarkCount = outgoing.filter((message) => message.event === "mark").length;
+    const silenceTimer = [...timers.values()].find((timer) => timer.delay === 8000);
+    assert.ok(silenceTimer);
+    await silenceTimer.callback();
+    await new Promise(setImmediate);
+    assert.equal(outgoing.filter((message) => message.event === "mark").length, previousMarkCount);
+    assert.equal(results.length, 1);
+    assert.equal(results[0].reason, "Twilio media stream stopped");
+    assert.deepEqual(endedCalls, []);
+    assert.deepEqual(errors, []);
+    return;
   }
 
   if (!scenario.callback) {
@@ -240,6 +335,12 @@ test(scenario.name, async () => {
     assert.equal(results[0].memory.callbackConfirmed, false);
   }
   assert.equal(results[0].survey.website_age, scenario.websiteAge);
+  if (scenario.noUnclearAge) {
+    assert.ok(results[0].memory.notes.every((note) => !note.startsWith("Unclear website age")));
+  }
+  if (scenario.onlineEnquiryStatus) {
+    assert.equal(results[0].memory.onlineEnquiryStatus, scenario.onlineEnquiryStatus);
+  }
   if (scenario.correctedBusiness) {
     assert.equal(results[0].customer.business_name, "New Business");
     assert.equal(results[0].survey.business_details_confirmed, "no");

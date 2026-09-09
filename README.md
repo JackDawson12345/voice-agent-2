@@ -5,6 +5,17 @@ The app transcribes Twilio calls using Deepgram Flux (`flux-general-en`) over
 audio in 80 ms frames and uses Flux's `EndOfTurn` to trigger a reply. Earlier
 transcript updates still feed the existing interruption and call-screening flow.
 
+Short answers such as "yes", "yeah", "yep", "yup", "uh-huh", and "mm-hmm"
+can confirm the current question. A completed answer clears the previous audio
+and its interruption timer before generating a reply. Questions become active
+when their audio starts, and each Flux turn retains the question that was active
+when the caller began speaking. This keeps a quick or repeated "yes" from being
+applied to a question that had not started yet.
+
+An incomplete enquiry answer such as "times" prompts for "yes, no, or sometimes".
+Complete frequency answers such as "two times" and "twice a week" are retained.
+Unclear speech is not automatically treated as consent or a website duration.
+
 ## Deepgram configuration
 
 Keep your existing `DEEPGRAM_API_KEY` in the environment or `.env`. No new

@@ -183,7 +183,9 @@ test("non-transcript messages are ignored and Flux errors reach the caller", () 
   recognition.receive({ type: "TurnInfo", event: "StartOfTurn", transcript: "", turn_index: 0 });
   recognition.socket.emit("message", Buffer.from("invalid JSON"));
   recognition.receive({ type: "Error", code: "INVALID_AUDIO", description: "Invalid audio format" });
-  assert.equal(recognition.transcripts.length, 0);
+  assert.equal(recognition.transcripts.length, 1);
+  assert.equal(recognition.transcripts[0].raw.event, "StartOfTurn");
+  assert.equal(recognition.transcripts[0].speechFinal, false);
   assert.equal(recognition.errors.length, 1);
   assert.equal(recognition.errors[0].code, "INVALID_AUDIO");
   assert.equal(recognition.errors[0].message, "Invalid audio format");
@@ -192,5 +194,5 @@ test("non-transcript messages are ignored and Flux errors reach the caller", () 
   assert.equal(recognition.errors[1], socketError);
   recognition.stream.close();
   recognition.receive({ type: "TurnInfo", event: "EndOfTurn", transcript: "late answer", turn_index: 0 });
-  assert.equal(recognition.transcripts.length, 0);
+  assert.equal(recognition.transcripts.length, 1);
 });

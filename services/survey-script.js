@@ -479,6 +479,9 @@ function getScriptedNextQuestion(
   }
 
   if (!memory.onlineEnquiryStatus) {
+    if (memory.onlineEnquiryNeedsClarification) {
+      return "Sorry, do you get enquiries online from new customers? You can say yes, no, or sometimes.";
+    }
     return "Do you get enquiries online from new customers?";
   }
 
