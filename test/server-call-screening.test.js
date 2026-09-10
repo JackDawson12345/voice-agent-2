@@ -99,12 +99,12 @@ async function createCall({ env = {}, synthesise } = {}) {
 
   return {
     spoken, outgoing, endedCalls, results, errors, timers,
-    async say(transcript, event = "EndOfTurn") {
+    async say(transcript, event = "EndOfTurn", metadata = {}) {
       const index = turnIndex;
       if (event === "EndOfTurn") turnIndex++;
       await onTranscript({
         transcript, isFinal: event === "EndOfTurn", speechFinal: event === "EndOfTurn",
-        raw: { type: "TurnInfo", event, turn_index: index },
+        raw: { type: "TurnInfo", event, turn_index: index, ...metadata },
       });
     },
     transcript: (result) => onTranscript(result),
@@ -136,6 +136,160 @@ async function createCall({ env = {}, synthesise } = {}) {
     },
   };
 }
+
+function recognitionConfidence(text, confidence) {
+  return {
+    words: text.split(/\s+/).map((word) => ({ word, confidence })),
+    end_of_turn_confidence: 0.99,
+  };
+}
+
+test("uncertain background words cannot cancel the intro or become a survey answer", async () => {
+  const call = await createCall();
+  await call.say("Yes", "StartOfTurn", recognitionConfidence("Yes", 0.2));
+  await call.say("Yes", "EndOfTurn", recognitionConfidence("Yes", 0.2));
+  await call.advance(700);
+  assert.equal(call.spoken.length, 1);
+  assert.equal(call.outgoing.filter((message) => message.event === "clear").length, 0);
+  await call.disconnect();
+  assert.equal(call.results[0].memory.isBusinessOwner, null);
+  assert.equal(call.results[0].transcript.filter((line) => line.role === "customer").length, 0);
+  assert.deepEqual(call.errors, []);
+});
+
+test("uncertain recognition cannot trigger screening or voicemail", async () => {
+  const call = await createCall();
+  await call.advance(700);
+  for (const text of [SCREENING_PROMPT, "Please leave a message after the tone."]) {
+    await call.say(text, "Update", recognitionConfidence(text, 0.2));
+    await call.say(text, "EndOfTurn", recognitionConfidence(text, 0.2));
+  }
+  await call.advance(1500);
+  assert.equal(call.spoken.length, 1);
+  assert.equal(call.outgoing.filter((message) => message.event === "clear").length, 0);
+  assert.equal(call.endedCalls.length, 0);
+  await call.disconnect();
+  assert.deepEqual(call.errors, []);
+});
+
+test("interruptions need stronger confidence but a completed short answer still works", async () => {
+  const call = await createCall();
+  await call.advance(700);
+  await call.say("Yes", "Update", recognitionConfidence("Yes", 0.65));
+  await call.advance(300);
+  assert.equal(call.outgoing.filter((message) => message.event === "clear").length, 0);
+  await call.say("Yes", "EndOfTurn", recognitionConfidence("Yes", 0.65));
+  assert.equal(call.outgoing.filter((message) => message.event === "clear").length, 1);
+  assert.equal(call.spoken.length, 2);
+  await call.disconnect();
+  assert.equal(call.results[0].memory.isBusinessOwner, "yes");
+  assert.deepEqual(call.errors, []);
+});
+
+for (const revision of ["empty update", "empty final", "low confidence", "weaker confidence", "filler"]) {
+  test(`a pending interruption is cancelled after a ${revision} revision`, async () => {
+    const call = await createCall();
+    await call.advance(700);
+    await call.say("Hello", "Update", recognitionConfidence("Hello", 0.95));
+    await call.advance(100);
+    const text = revision.startsWith("empty") ? "" : revision === "filler" ? "um" : "Hello";
+    const confidence = revision === "low confidence" ? 0.2 : revision === "weaker confidence" ? 0.65 : 0.95;
+    await call.say(text, revision === "empty final" ? "EndOfTurn" : "Update", recognitionConfidence(text, confidence));
+    await call.advance(300);
+    assert.equal(call.outgoing.filter((message) => message.event === "clear").length, 0);
+    assert.equal(call.spoken.length, 1);
+    await call.disconnect();
+    assert.deepEqual(call.errors, []);
+  });
+}
+
+test("repeated noise and empty turn starts cannot postpone the silence check", async () => {
+  const call = await createCall();
+  await call.advance(700);
+  call.finishAudio();
+  for (let i = 0; i < 7; i++) {
+    await call.advance(1000);
+    await call.say("", "StartOfTurn");
+    await call.say("Yes", "EndOfTurn", recognitionConfidence("Yes", 0.1));
+  }
+  await call.say("", "StartOfTurn");
+  await call.advance(1000);
+  assert.equal(call.spoken.at(-1), "Hello, are you still on the line?");
+  await call.disconnect();
+  assert.deepEqual(call.errors, []);
+});
+
+test("a retracted speech update resumes the silence check after playback finishes", async () => {
+  const call = await createCall();
+  await call.advance(700);
+  await call.say("Hello", "Update", recognitionConfidence("Hello", 0.95));
+  call.finishAudio();
+  await call.say("", "Update");
+  await call.advance(8000);
+  assert.equal(call.spoken.at(-1), "Hello, are you still on the line?");
+  await call.disconnect();
+  assert.deepEqual(call.errors, []);
+});
+
+for (const text of ["Yes", "No", "Stop"]) {
+  test(`confident short speech can still interrupt: ${text}`, async () => {
+    const call = await createCall();
+    await call.advance(700);
+    await call.say(text, "Update", recognitionConfidence(text, 0.95));
+    await call.advance(250);
+    assert.equal(call.outgoing.filter((message) => message.event === "clear").length, 1);
+    await call.say(text, "EndOfTurn", recognitionConfidence(text, 0.95));
+    assert.equal(call.spoken.length, 2);
+    await call.disconnect();
+    assert.deepEqual(call.errors, []);
+  });
+}
+
+test("a rejected final never restores a confident interim answer", async () => {
+  const call = await createCall();
+  await call.advance(700);
+  await call.say("Yes", "Update", recognitionConfidence("Yes", 0.95));
+  await call.advance(250);
+  await call.say("Yes", "EndOfTurn", recognitionConfidence("Yes", 0.2));
+  await call.advance(8000);
+  assert.equal(call.spoken.at(-1), "Hello, are you still on the line?");
+  await call.disconnect();
+  assert.equal(call.results[0].memory.isBusinessOwner, null);
+  assert.equal(call.results[0].transcript.filter((line) => line.role === "customer").length, 0);
+  assert.deepEqual(call.errors, []);
+});
+
+test("noise confidence thresholds can be tuned or disabled", async () => {
+  const call = await createCall({ env: {
+    MIN_TRANSCRIPT_CONFIDENCE: "0.8", BARGE_IN_MIN_CONFIDENCE: "0.9",
+  } });
+  await call.advance(700);
+  await call.say("Yes", "EndOfTurn", recognitionConfidence("Yes", 0.75));
+  assert.equal(call.spoken.length, 1);
+  await call.say("Yes", "Update", recognitionConfidence("Yes", 0.85));
+  await call.advance(300);
+  assert.equal(call.outgoing.filter((message) => message.event === "clear").length, 0);
+  await call.disconnect();
+
+  const disabled = await createCall({ env: {
+    MIN_TRANSCRIPT_CONFIDENCE: "0", BARGE_IN_MIN_CONFIDENCE: "0",
+  } });
+  await disabled.advance(700);
+  await disabled.say("Yes", "Update", recognitionConfidence("Yes", 0.1));
+  await disabled.advance(250);
+  assert.equal(disabled.outgoing.filter((message) => message.event === "clear").length, 1);
+  await disabled.say("Yes", "EndOfTurn", recognitionConfidence("Yes", 0.1));
+  await disabled.disconnect();
+  assert.equal(disabled.results[0].memory.isBusinessOwner, "yes");
+});
+
+test("invalid noise confidence thresholds fail at startup", async () => {
+  for (const name of ["MIN_TRANSCRIPT_CONFIDENCE", "BARGE_IN_MIN_CONFIDENCE"]) {
+    for (const value of ["-0.1", "1.1", "NaN", "Infinity"]) {
+      await assert.rejects(createCall({ env: { [name]: value } }), new RegExp(name));
+    }
+  }
+});
 
 test("the logged screening handoff stays quiet until the recipient speaks", async () => {
   const call = await createCall();

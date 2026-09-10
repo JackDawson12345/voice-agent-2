@@ -81,6 +81,31 @@ const INTRO_DELAY_MS = Number(process.env.INTRO_DELAY_MS || 700);
 const SILENCE_TIMEOUT_MS = Number(process.env.SILENCE_TIMEOUT_MS || 8000);
 const MAX_SILENCE_CHECKS = Number(process.env.MAX_SILENCE_CHECKS || 1);
 const BARGE_IN_DEBOUNCE_MS = Number(process.env.BARGE_IN_DEBOUNCE_MS || 250);
+const MIN_TRANSCRIPT_CONFIDENCE = readConfidenceSetting("MIN_TRANSCRIPT_CONFIDENCE", 0.55);
+const BARGE_IN_MIN_CONFIDENCE = readConfidenceSetting("BARGE_IN_MIN_CONFIDENCE", 0.75);
+
+function readConfidenceSetting(name, fallback) {
+  const value = Number(process.env[name] || fallback);
+  if (!Number.isFinite(value) || value < 0 || value > 1) {
+    throw new Error(`${name} must be a number between 0 and 1`);
+  }
+  return value;
+}
+
+function getTranscriptConfidence(raw) {
+  // Flux supplies recognition confidence per word. end_of_turn_confidence
+  // only measures whether the speaker has finished, not whether words are real.
+  const words = raw?.type === "TurnInfo"
+    ? raw.words
+    : raw?.channel?.alternatives?.[0]?.words;
+  const confidences = Array.isArray(words)
+    ? words.map((word) => word?.confidence).filter((value) =>
+        Number.isFinite(value) && value >= 0 && value <= 1)
+    : [];
+  return confidences.length
+    ? confidences.reduce((sum, value) => sum + value, 0) / confidences.length
+    : null;
+}
 
 // Safety net for final messages (do-not-call, voicemail, callback
 // confirmation). If Twilio's "mark" event for that audio never arrives -
@@ -1022,7 +1047,7 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    if (aiIsSpeaking || pendingFluxPrompt) {
+    if (aiIsSpeaking || pendingFluxPrompt?.hasAcceptedSpeech) {
       return;
     }
 
@@ -1991,7 +2016,7 @@ wss.on("connection", (ws) => {
     clearPendingBargeInTimer();
   }
 
-  function scheduleBargeIn(cleanTranscript) {
+  function scheduleBargeIn(cleanTranscript, confidence) {
     if (!aiIsSpeaking) {
       return;
     }
@@ -2000,7 +2025,10 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    if (!looksLikeRealInterruption(cleanTranscript)) {
+    if ((confidence !== null && confidence < BARGE_IN_MIN_CONFIDENCE) ||
+        !looksLikeRealInterruption(cleanTranscript)) {
+      // A revised hypothesis can retract the speech that started the timer.
+      clearPendingBargeInTimer();
       return;
     }
 
@@ -2011,7 +2039,7 @@ wss.on("connection", (ws) => {
     }
 
     // Wait briefly before clearing audio.
-    // This makes interruption feel less harsh and filters out quick false starts.
+    // Confidence checks and later revisions determine whether this stays valid.
     const interruptedMark = activeAudioMark;
     pendingBargeInTimer = setTimeout(() => {
       if (!aiIsSpeaking || activeAudioMark !== interruptedMark) {
@@ -2042,8 +2070,9 @@ wss.on("connection", (ws) => {
         const cleanTranscript = normaliseTranscriptText(transcript);
         const isFluxTurn = raw?.type === "TurnInfo";
         const speechStarted = isFluxTurn && raw.event === "StartOfTurn";
+        const confidence = getTranscriptConfidence(raw);
 
-        if (!cleanTranscript && !utteranceEnd && !speechFinal && !speechStarted) {
+        if (!cleanTranscript && !utteranceEnd && !speechFinal && !isFluxTurn) {
           return;
         }
 
@@ -2060,8 +2089,38 @@ wss.on("connection", (ws) => {
         // its final transcript arrives after another prompt starts playing.
         if (isFluxTurn && (speechStarted || cleanTranscript) &&
             (!pendingFluxPrompt || pendingFluxPrompt.turnIndex !== raw.turn_index)) {
-          pendingFluxPrompt = { turnIndex: raw.turn_index, key: activePromptKey, text: activePromptText };
+          clearPendingBargeInTimer();
+          pendingFluxPrompt = {
+            turnIndex: raw.turn_index, key: activePromptKey, text: activePromptText,
+            hasAcceptedSpeech: false,
+          };
         }
+
+        // Ignore uncertain recognition before it can interrupt, cancel the
+        // introduction, trigger screening/voicemail or become a survey answer.
+        // Keep the original question until the turn ends in case confidence
+        // improves. Never merge rejected words back into a completed answer.
+        if ((isFluxTurn && !cleanTranscript) ||
+            (cleanTranscript && confidence !== null && confidence < MIN_TRANSCRIPT_CONFIDENCE)) {
+          clearPendingBargeInTimer();
+          if (pendingFluxPrompt) pendingFluxPrompt.hasAcceptedSpeech = false;
+          if (speechFinal || utteranceEnd) {
+            pendingFluxPrompt = null;
+            resetPendingCustomerUtterance();
+            lastInterruptionTranscript = "";
+          }
+          if (cleanTranscript) {
+            console.log("Ignoring low-confidence speech:", {
+              confidence, threshold: MIN_TRANSCRIPT_CONFIDENCE, event: raw?.event,
+            });
+          }
+          // Rejected noise must neither suspend nor repeatedly reset the
+          // silence deadline. Resume it if an earlier accepted update paused it.
+          if (!silenceTimer) startSilenceTimer();
+          return;
+        }
+
+        if (pendingFluxPrompt) pendingFluxPrompt.hasAcceptedSpeech = true;
 
         // Any real transcript means the customer, voicemail, or screening assistant has spoken.
         // Stop silence timeout while we process it.
@@ -2092,7 +2151,7 @@ wss.on("connection", (ws) => {
 
         // 3. Normal barge-in behaviour.
         if (aiIsSpeaking && !awaitingScreenedCaller) {
-          scheduleBargeIn(cleanTranscript);
+          scheduleBargeIn(cleanTranscript, confidence);
         }
 
         if (cleanTranscript) {

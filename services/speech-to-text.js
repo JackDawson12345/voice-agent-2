@@ -110,7 +110,8 @@ function createSpeechToTextStream({ onTranscript, onOpen, onClose, onError, keyt
 
       const transcript = typeof data.transcript === "string" ? data.transcript : "";
       const speechFinal = data.event === "EndOfTurn";
-      if (!transcript && !speechFinal && data.event !== "StartOfTurn") return;
+      // Empty revisions can retract an earlier hypothesis. Forward them so
+      // the caller can cancel a pending interruption and resume silence checks.
 
       // Flux sends the entire turn on each update, not separate final segments.
       // EagerEndOfTurn and TurnResumed remain interim until EndOfTurn arrives.

@@ -63,6 +63,39 @@ Run `npm test` for the local regression suite and restart the app with `npm star
 after deploying the changes. A live transcription check requires a valid
 Deepgram API key and incoming Twilio audio.
 
+## Background noise and false interruptions
+
+The app checks the average of Deepgram's supplied word confidence scores before
+acting on a transcript. Uncertain recognition is ignored before it can stop
+Lily, cancel her introduction, trigger screening/voicemail or become an answer.
+Interim interruptions require stronger confidence than completed answers, so
+clear short replies such as "yes", "no" and "stop" still work. A revised or empty
+hypothesis cancels any pending interruption. Rejected noise does not postpone
+the silence check, and rejected final turns never reuse earlier guesses.
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `MIN_TRANSCRIPT_CONFIDENCE` | `0.55` | Minimum average word confidence for accepting speech, from `0` to `1`. |
+| `BARGE_IN_MIN_CONFIDENCE` | `0.75` | Additional minimum for an interim transcript to interrupt Lily. Completed answers use `MIN_TRANSCRIPT_CONFIDENCE`. |
+| `BARGE_IN_DEBOUNCE_MS` | `250` | Delay before an eligible interim transcript interrupts playback, in milliseconds. |
+
+These are app settings, applied after recognition. If confidence scores are
+missing, the existing transcript handling is used. Set both confidence settings
+to `0` to disable confidence filtering. Higher values reject more uncertain
+speech but can also miss quiet or unclear callers; tune in small increments
+using representative calls. The defaults are starting values, not calibrated
+against recorded calls. Restart the backend after changing settings.
+
+This reduces reactions to uncertain recognition; it does not remove noise from
+the audio or identify which person spoke. Clearly recognised background speech
+can still pass. Audio continues to reach Deepgram unchanged. Actual audio
+suppression needs evaluation on call samples, especially because this survey
+relies on short answers. See Deepgram's
+[word confidence fields](https://developers.deepgram.com/reference/speech-to-text/listen-flux)
+and [audio preprocessing guidance](https://developers.deepgram.com/voice-agent/optimize/audio-preprocessing-barge-in).
+`DEEPGRAM_EOT_THRESHOLD` controls when a turn ends and is not a noise sensitivity
+setting.
+
 ## Callback scheduling
 
 Weekday names and spoken callback times (including "three pm" and "anytime")

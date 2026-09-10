@@ -119,6 +119,17 @@ test("empty turn boundaries are forwarded without recycling words from the previ
   assert.equal(recognition.transcripts[1].speechFinal, true);
 });
 
+test("Flux forwards word confidence and empty revisions so false interruptions can be cancelled", () => {
+  const recognition = recognitionStream();
+  const words = [{ word: "Hello", confidence: 0.2, start: 0, end: 0.3 }];
+  recognition.receive({ type: "TurnInfo", event: "Update", transcript: "Hello", words, turn_index: 0 });
+  recognition.receive({ type: "TurnInfo", event: "Update", transcript: "", words: [], turn_index: 0 });
+  assert.equal(recognition.transcripts.length, 2);
+  assert.equal(recognition.transcripts[0].raw.words[0].confidence, 0.2);
+  assert.equal(recognition.transcripts[1].transcript, "");
+  assert.equal(recognition.transcripts[1].speechFinal, false);
+});
+
 test("invalid turn settings fail before opening a connection", () => {
   for (const [name, values] of [
     ["DEEPGRAM_EOT_THRESHOLD", ["0.49", "1.1", "NaN"]],
