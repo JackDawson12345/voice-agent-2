@@ -58,8 +58,8 @@ async function createCall({ env = {}, synthesise } = {}) {
     "./services/text-to-speech": {
       textToSpeech: async (text) => {
         spoken.push(text);
-        if (synthesise) await synthesise(text);
-        return Buffer.alloc(800);
+        const audio = synthesise ? await synthesise(text) : null;
+        return audio ?? Buffer.alloc(800);
       },
     },
     "./services/session-memory": memoryService,
@@ -142,6 +142,56 @@ function recognitionConfidence(text, confidence) {
     words: text.split(/\s+/).map((word) => ({ word, confidence })),
     end_of_turn_confidence: 0.99,
   };
+}
+
+for (const receiveClosingMark of [true, false]) {
+  test(`callback closing stays quiet through playback and hangup (mark received: ${receiveClosingMark})`, async () => {
+    let queuedSilenceTimeout;
+    const call = await createCall({ synthesise: async (text) => {
+      if (!text.includes("arranged the callback")) return;
+      // Flux can send an empty turn while the closing audio is synthesising.
+      // Previously this armed an eight-second silence check that survived playback.
+      await call.say("", "StartOfTurn");
+      await call.say("");
+      queuedSilenceTimeout = [...call.timers.values()]
+        .find((timer) => timer.delay === 8000)?.callback;
+      return Buffer.alloc(60000); // 7.5 seconds of mu-law audio.
+    } });
+    for (const answer of ["Jack speaking.", "No. I'm not.", "No. I'm not.", "Yes.", "Next Friday."]) {
+      await call.say(answer);
+      call.finishAudio();
+      await call.advance(100);
+    }
+    await call.say("One PM.");
+    assert.match(call.spoken.at(-1), /arranged the callback for Next Friday at one pm/);
+    const spokenCount = call.spoken.length;
+    const outgoingCount = call.outgoing.length;
+    await call.advance(7500);
+    if (receiveClosingMark) call.finishAudio();
+    else await call.advance(2400); // Playback estimate + grace + fallback margin.
+
+    // Even a timeout already queued before cancellation must respect hangup.
+    if (queuedSilenceTimeout) await queuedSilenceTimeout();
+    await call.advance(500);
+    assert.equal(call.spoken.length, spokenCount, "A silence check played after the closing message");
+    assert.equal(call.endedCalls.length, 0, "Allow the final hangup grace period");
+    await call.say("", "StartOfTurn");
+    await call.say("Yes", "EndOfTurn", recognitionConfidence("Yes", 0.1));
+    await call.say("Thanks, goodbye.");
+    assert.equal(call.outgoing.length, outgoingCount, "Late speech must not restart the conversation");
+    await call.advance(700);
+    await call.advance(10000);
+    assert.equal(call.spoken.length, spokenCount);
+    assert.deepEqual(call.endedCalls, ["CA-screening"]);
+    assert.equal(call.results.length, 1);
+    assert.equal(call.results[0].reason, "Callback arranged");
+    assert.equal(call.results[0].memory.callbackConfirmed, true);
+    assert.equal(call.results[0].survey.callback_date, "Next Friday");
+    assert.equal(call.results[0].survey.callback_time, "one pm");
+    assert.ok(call.results[0].transcript.every((line) => !/still on the line/.test(line.content)));
+    assert.equal(call.timers.size, 0);
+    assert.deepEqual(call.errors, []);
+  });
 }
 
 test("uncertain background words cannot cancel the intro or become a survey answer", async () => {

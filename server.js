@@ -971,7 +971,14 @@ wss.on("connection", (ws) => {
     return Math.ceil(audioBuffer.length / 8);
   }
 
+  function isCallClosing() {
+    // Keep the closing state through playback, fallback and the final grace
+    // period, before endCallNow sets callIsEnding.
+    return Boolean(callIsEnding || pendingHangupAfterMark || pendingFinalHangupTimer);
+  }
+
   function scheduleFinalHangup(reason) {
+    clearSilenceTimer();
     clearPendingFinalHangupTimer();
 
     pendingFinalHangupTimer = setTimeout(() => {
@@ -989,6 +996,9 @@ wss.on("connection", (ws) => {
     pendingHangupAfterMark = markName;
     callEndReason = reason;
 
+    clearSilenceTimer();
+    silenceWatchMarks.clear();
+    clearPendingBargeInTimer();
     clearPendingHangupFallbackTimer();
     clearPendingFinalHangupTimer();
 
@@ -1039,7 +1049,7 @@ wss.on("connection", (ws) => {
   function startSilenceTimer() {
     clearSilenceTimer();
 
-    if (callIsEnding || awaitingScreenedCaller) {
+    if (isCallClosing() || awaitingScreenedCaller) {
       return;
     }
 
@@ -1069,7 +1079,7 @@ wss.on("connection", (ws) => {
   }
 
   async function handleSilenceTimeout() {
-    if (callIsEnding || awaitingScreenedCaller) {
+    if (isCallClosing() || awaitingScreenedCaller) {
       return;
     }
 
@@ -1098,7 +1108,7 @@ wss.on("connection", (ws) => {
 
   async function playSilenceCheckMessage() {
     try {
-      if (callIsEnding || voicemailHandled || awaitingScreenedCaller) {
+      if (isCallClosing() || voicemailHandled || awaitingScreenedCaller) {
         return;
       }
 
@@ -1129,7 +1139,7 @@ wss.on("connection", (ws) => {
       const audio = await textToSpeech(message);
 
       if (
-        callIsEnding ||
+        isCallClosing() ||
         voicemailHandled ||
         awaitingScreenedCaller ||
         thisResponseId !== responseGenerationId
@@ -2076,12 +2086,9 @@ wss.on("connection", (ws) => {
           return;
         }
 
-        // Once a final message (do-not-call, voicemail, callback confirmation,
-        // goodbye) is playing or the call is already ending, ignore further
-        // speech entirely. Treating it as a barge-in would clear Twilio's
-        // audio buffer, which silently drops the "mark" event the hangup
-        // depends on - the fallback timer will end the call instead.
-        if (callIsEnding || pendingHangupAfterMark) {
+        // Ignore further speech during the final message and the grace period
+        // before hangup, so it cannot interrupt the closing or start a new reply.
+        if (isCallClosing()) {
           return;
         }
 
